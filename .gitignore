@@ -1,0 +1,25 @@
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+*.pyd
+.venv/
+venv/
+
+# Local user data and logs
+pdps_master_config.json
+pdps_master_config_v13.xlsx
+paths_config.json
+paths_config.ini
+recent_projects.json
+pdps_ui_settings.json
+crash.log
+
+# Build output
+build/
+dist/
+*.exe
+
+# IDE / tooling files
+.idea/
+.claude/
+.vscode/
