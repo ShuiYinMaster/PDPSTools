@@ -1,0 +1,2068 @@
+# -*- coding: utf-8 -*-
+"""
+PDPSManagerApp - PyQt5 GUI 重写版
+将原 tkinter GUI 全部替换为 PyQt5，业务逻辑类保持不变。
+"""
+
+import os
+import sys
+import subprocess
+import threading
+import queue
+import traceback
+import json
+import math
+import zipfile
+from datetime import datetime
+from typing import List, Dict, Optional, Tuple
+
+import pandas as pd
+import numpy as np
+import winreg
+import re
+import ctypes
+
+from PIL import Image
+
+# ── PyQt5 ──────────────────────────────────────────────────────────────────
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QTabWidget, QFrame, QSplitter,
+    QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout,
+    QLabel, QPushButton, QLineEdit, QTextEdit, QPlainTextEdit,
+    QComboBox, QCheckBox, QRadioButton, QButtonGroup,
+    QTreeWidget, QTreeWidgetItem, QHeaderView,
+    QTableWidget, QTableWidgetItem, QAbstractItemView,
+    QProgressBar, QScrollArea, QGroupBox,
+    QMenu, QAction, QMessageBox, QFileDialog, QDialog,
+    QStatusBar, QSizePolicy, QDoubleSpinBox, QSpinBox,
+    QStyleFactory
+)
+from PyQt5.QtGui import (
+    QFont, QColor, QPixmap, QIcon, QPalette, QImage,
+    QStandardItemModel, QStandardItem
+)
+from PyQt5.QtCore import (
+    Qt, QThread, pyqtSignal, QTimer, QSize, QMimeData, QModelIndex
+)
+
+# ── 全局常量 ────────────────────────────────────────────────────────────────
+CONFIG_FILE = "pdps_master_config_v13.xlsx"
+REG_PATH = r"Software\TECNOMATIX\TUNE\NewAssembler\Options\EMS"
+
+# ── pycatia 可选导入 ────────────────────────────────────────────────────────
+try:
+    from pycatia import catia as pycatia_catia
+    from pycatia.mec_mod_interfaces.part_document import PartDocument
+    PYCATIA_AVAILABLE = True
+except Exception:
+    PYCATIA_AVAILABLE = False
+
+
+# ============================================================================
+# 业务逻辑类（直接从原文件保留，不做任何修改）
+# ============================================================================
+
+# ── CATIAWeldPointExtractor ──────────────────────────────────────────────────
+class CATIAWeldPointExtractor:
+    """CATIA 焊点提取工具类（兼容 win32com 和 pycatia）"""
+    def __init__(self, catia_app=None):
+        self.catia_app = catia_app
+        self.weld_points_data: List[Dict] = []
+        self.status_message = "就绪"
+        self.connection_type = None
+
+    def connect_catia(self, use_pycatia=False) -> bool:
+        try:
+            if use_pycatia:
+                if not PYCATIA_AVAILABLE:
+                    return False
+                self.catia_app = pycatia_catia()
+                self.connection_type = 'pycatia'
+                self.status_message = "已连接 | CATIA (pycatia)"
+                return True
+            else:
+                import win32com.client
+                try:
+                    self.catia_app = win32com.client.GetActiveObject("CATIA.Application")
+                except Exception:
+                    self.catia_app = win32com.client.Dispatch("CATIA.Application")
+                self.connection_type = 'win32com'
+                self.status_message = "已连接 | CATIA (win32com)"
+                return True
+        except Exception as e:
+            self.status_message = "连接 CATIA 失败"
+            return False
+
+    def set_catia_app(self, catia_app, connection_type='win32com'):
+        self.catia_app = catia_app
+        self.connection_type = connection_type
+        self.status_message = f"CATIA 应用已设置 ({connection_type})"
+
+    def get_status(self):
+        return self.status_message
+
+    def extract_weld_points(self, auto_rename: bool = False) -> List[Dict]:
+        if not self.catia_app:
+            self.status_message = "请先连接 CATIA"
+            return []
+        self.weld_points_data = []
+        try:
+            if self.connection_type == 'pycatia':
+                doc = self.catia_app.active_document
+                if not doc or not hasattr(doc, 'part'):
+                    self.status_message = "当前文档不是 Part 文档"
+                    return []
+                part = doc.part
+                selection = doc.selection
+                part_full_name = doc.name
+            else:
+                doc = self.catia_app.ActiveDocument
+                if not doc:
+                    return []
+                try:
+                    part = doc.Part
+                except:
+                    self.status_message = "当前文档不是 Part 文档"
+                    return []
+                selection = doc.Selection
+                part_full_name = doc.Name
+
+            spa_workbench = None
+            try:
+                if self.connection_type == 'pycatia':
+                    spa_workbench = doc.spa_workbench()
+                else:
+                    spa_workbench = doc.GetWorkbench("SPAWorkbench")
+            except:
+                pass
+
+            if self.connection_type == 'pycatia':
+                selection.clear()
+                selection.search("CATGmoSearch.Point,all")
+                count = selection.count
+            else:
+                selection.Clear()
+                selection.Search("CATGmoSearch.Point,all")
+                count = selection.Count
+
+            # ── 预扫描：构建 {点名称 → 直接父图形集名称} 映射表 ────────────
+            # 比逐点调用 .Parent 更可靠，避免 win32com/pycatia 的 Parent 属性失效问题
+            point_parent_map = self._build_point_parent_map(part)
+
+            for i in range(1, count + 1):
+                try:
+                    if self.connection_type == 'pycatia':
+                        item = selection.item(i)
+                        point_obj = item.value
+                        name = getattr(point_obj, 'name', f"Point_{i}")
+                    else:
+                        item = selection.Item(i)
+                        point_obj = item.Value
+                        name = getattr(point_obj, 'Name', f"Point_{i}")
+
+                    # ── 从映射表获取父图形集名 ──────────────────────────────
+                    # 优先用精确名查询，再去掉 GSMPoint 后缀的基本名匹配
+                    geo_set_name = point_parent_map.get(name, "")
+                    if not geo_set_name:
+                        # 点名可能含 ".N" 后缀，尝试去掉后缀再匹配
+                        base_name = re.sub(r'\.GSMPoint\.\d+$', '', name, flags=re.IGNORECASE)
+                        base_name = re.sub(r'-GSMPoint\.\d+$', '', base_name, flags=re.IGNORECASE)
+                        geo_set_name = point_parent_map.get(base_name, "")
+
+                    # ── 获取坐标 ────────────────────────────────────────────
+                    x, y, z = 0, 0, 0
+                    try:
+                        if spa_workbench:
+                            if self.connection_type == 'pycatia':
+                                ref = part.create_reference_from_object(point_obj)
+                                m = spa_workbench.get_measurable(ref)
+                                coords = m.get_point()
+                            else:
+                                ref = part.CreateReferenceFromObject(point_obj)
+                                m = spa_workbench.GetMeasurable(ref)
+                                coords = [0, 0, 0]
+                                m.GetPoint(coords)
+                            x, y, z = coords[0], coords[1], coords[2]
+                    except:
+                        pass
+
+                    # ── 自动重命名 ───────────────────────────────────────────
+                    # geo_set_name 即为图形集名（如 DPUB-501000588-XAX&DPUB-501000592-XAX&...）
+                    # 直接用它提取零件号，无需再向上遍历父节点
+                    std_name = name
+                    if auto_rename:
+                        std_name = self._generate_standard_name(name, geo_set_name)
+
+                    # ── 根据图形集名称中 & 数量推断焊接层数类型 ────────────
+                    weld_type = self._weld_type_from_location(geo_set_name)
+                    location_str = f"{x:.3f},{y:.3f},{z:.3f}"
+                    self.weld_points_data.append({
+                        "Class": "PmWeldPoint",
+                        "ExternalId": std_name,
+                        "Name": std_name,
+                        "Location": location_str,
+                        "X": round(x, 3),
+                        "Y": round(y, 3),
+                        "Z": round(z, 3),
+                        "Type": weld_type
+                    })
+                except:
+                    pass
+
+            self.status_message = f"已提取 {len(self.weld_points_data)} 个焊点"
+        except Exception as e:
+            self.status_message = f"提取失败: {e}"
+        return self.weld_points_data
+
+    def _generate_standard_name(self, original_name: str, geo_set_name: str) -> str:
+        """
+        生成标准命名：{前缀}_{零件数字段}_{焊点数字段}
+
+        焊点名示例：  T1E-0000010296-RSW-GSMPoint.2
+          → 前缀 = T1E，焊点 ID = 10296
+
+        图形集名示例：DPUB-501000588-XAX&DPUB-501000592-XAX&DPUB-501001638-XAX
+          → 取第一段 DPUB-501000588-XAX，零件 ID = 501000588（首个纯数字段）
+
+        结果示例：T1E_501000588_10296
+        """
+        try:
+            # ── 1. 提取前缀（焊点名第一个"-"之前）──────────────────────────
+            orig_segs = original_name.split('-')
+            prefix = orig_segs[0].strip() if orig_segs else "UNK"
+
+            # ── 2. 提取零件 ID（从图形集名第一个 & 段中找首个纯数字段）──────
+            part_id = ""
+            if geo_set_name:
+                # 取 & 之前的第一个零件名段，如 "DPUB-501000588-XAX"
+                first_part_seg = geo_set_name.split('&')[0].strip()
+                for seg in first_part_seg.split('-'):
+                    seg_clean = seg.split('_')[0]       # 去掉下划线后缀，如 "XWS_00" → "XWS"
+                    if seg_clean.isdigit():
+                        part_id = seg_clean
+                        break
+                if not part_id:
+                    # 降级：取第二段（不要求纯数字）
+                    p_segs = first_part_seg.split('-')
+                    part_id = p_segs[1].split('_')[0] if len(p_segs) > 1 else p_segs[0]
+
+            if not part_id:
+                part_id = re.sub(r'[^A-Za-z0-9]', '', geo_set_name)[:12] or "PART"
+
+            # ── 3. 提取焊点数字（第二段去前导零）──────────────────────────
+            weld_id = "0"
+            if len(orig_segs) > 1:
+                raw = orig_segs[1].strip()
+                weld_id = raw.lstrip('0') or "0"
+
+            return f"{prefix}_{part_id}_{weld_id}"
+        except Exception:
+            return original_name
+
+    @staticmethod
+    def _weld_type_from_location(location_name: str) -> str:
+        """
+        根据图形集名称中 '&' 的数量推断焊接层数类型：
+          无 & 或 1 个 & → 双层板 → "2T"
+          2 个 &         → 三层板 → "3T"
+          N 个 &         → (N+1) 层板 → "{N+1}T"
+
+        规则：N 个 & 连接 (N+1) 个零件，即 (N+1) 层板。
+        无 & 时认为只有1个零件段，默认双层板（实际为单零件贴合场景取2T）。
+        """
+        count = location_name.count('&')
+        layers = max(2, count + 1)   # 0 个 & → 1 个零件 → 默认 2T; 2 个 & → 3 个零件 → 3T
+        return f"{layers}T"
+
+    def _build_point_parent_map(self, part) -> Dict[str, str]:
+        """
+        预扫描零件的全部 HybridBodies（图形集）层级，
+        构建 {点名称: 直接父图形集名称} 映射表。
+        支持 win32com 和 pycatia 两种连接方式。
+        """
+        point_parent_map: Dict[str, str] = {}
+
+        def _scan_body(hb, conn_type: str):
+            """递归扫描一个 HybridBody 内的所有点和子图形集。"""
+            try:
+                if conn_type == 'pycatia':
+                    hb_name = hb.name
+                    shapes = hb.hybrid_shapes
+                    shape_count = shapes.count
+                    sub_bodies = hb.hybrid_bodies
+                    sub_count = sub_bodies.count
+                    def get_shape(j): return shapes.item(j)
+                    def get_shape_name(s): return s.name
+                    def get_sub(j): return sub_bodies.item(j)
+                else:
+                    hb_name = hb.Name
+                    shapes = hb.HybridShapes
+                    shape_count = shapes.Count
+                    sub_bodies = hb.HybridBodies
+                    sub_count = sub_bodies.Count
+                    def get_shape(j): return shapes.Item(j)
+                    def get_shape_name(s): return s.Name
+                    def get_sub(j): return sub_bodies.Item(j)
+
+                # 登记本 HybridBody 内直属的所有形状
+                for j in range(1, shape_count + 1):
+                    try:
+                        shape = get_shape(j)
+                        sname = get_shape_name(shape)
+                        if sname:
+                            point_parent_map[sname] = hb_name
+                    except Exception:
+                        pass
+
+                # 递归处理子图形集（但子图形集内的点归属子图形集，不覆盖父级）
+                for j in range(1, sub_count + 1):
+                    try:
+                        _scan_body(get_sub(j), conn_type)
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                print(f"_scan_body error: {e}")
+
+        try:
+            if self.connection_type == 'pycatia':
+                root_bodies = part.hybrid_bodies
+                for i in range(1, root_bodies.count + 1):
+                    _scan_body(root_bodies.item(i), 'pycatia')
+            else:
+                root_bodies = part.HybridBodies
+                for i in range(1, root_bodies.Count + 1):
+                    _scan_body(root_bodies.Item(i), 'win32com')
+        except Exception as e:
+            print(f"_build_point_parent_map error: {e}")
+
+        return point_parent_map
+
+    def log_error(self, context, error):
+        print(f"Error in {context}: {error}")
+        traceback.print_exc()
+        self.status_message = f"错误: {context}"
+
+
+# ── CATIASphereScanner ──────────────────────────────────────────────────────
+class CATIASphereScanner:
+    def __init__(self, catia_app=None):
+        self.catia_app = catia_app
+        self.sphere_data = []
+
+    def set_catia_app(self, catia_app):
+        self.catia_app = catia_app
+
+    def scan_selected_objects(self) -> List[Dict]:
+        if not self.catia_app:
+            raise Exception("CATIA 未连接")
+        try:
+            document = self.catia_app.active_document
+            part_doc = PartDocument(document.com_object)
+            part = part_doc.part
+            selection = document.selection
+            spa_workbench = part_doc.spa_workbench()
+            count = selection.count
+            if count == 0:
+                return []
+            self.sphere_data = []
+            for i in range(1, count + 1):
+                try:
+                    selected_obj = selection.item(i).value
+                    obj_name = getattr(selected_obj, 'name', f"Object_{i}")
+                    reference = part.create_reference_from_object(selected_obj)
+                    measurable = spa_workbench.get_measurable(reference)
+                    cog = measurable.get_cog()
+                    try:
+                        volume = measurable.volume
+                    except:
+                        volume = 0
+                    radius = (volume * 3 / (4 * 3.14159265359)) ** (1 / 3) if volume > 0 else 0
+                    self.sphere_data.append({
+                        "Name": obj_name,
+                        "X": f"{cog[0]:.2f}",
+                        "Y": f"{cog[1]:.2f}",
+                        "Z": f"{cog[2]:.2f}",
+                        "Radius": f"{radius:.2f}",
+                        "Volume": round(volume, 3),
+                        "Type": "实体" if volume > 0 else "几何图形",
+                        "_coords": cog
+                    })
+                except Exception as e:
+                    print(f"无法测量对象 {i}: {e}")
+            return self.sphere_data
+        except Exception as e:
+            traceback.print_exc()
+            return []
+
+    def scan_all_bodies(self, search_keywords=None):
+        if not self.catia_app:
+            raise Exception("CATIA 未连接")
+        try:
+            document = self.catia_app.active_document
+            part_doc = PartDocument(document.com_object)
+            part = part_doc.part
+            spa_workbench = part_doc.spa_workbench()
+            self.sphere_data = []
+            bodies = part.bodies
+            for i in range(1, bodies.count + 1):
+                body = bodies.item(i)
+                if search_keywords:
+                    if not any(kw.lower() in body.name.lower() for kw in search_keywords):
+                        continue
+                try:
+                    reference = part.create_reference_from_object(body)
+                    measurable = spa_workbench.get_measurable(reference)
+                    cog = measurable.get_cog()
+                    volume = measurable.volume
+                    self.sphere_data.append({
+                        "Name": body.name,
+                        "X": f"{cog[0]:.2f}",
+                        "Y": f"{cog[1]:.2f}",
+                        "Z": f"{cog[2]:.2f}",
+                        "Radius": f"{(volume * 3 / (4 * 3.14)) ** (1 / 3):.2f}" if volume > 0 else "0",
+                        "Volume": round(volume, 3),
+                        "Type": "Body",
+                        "_coords": cog
+                    })
+                except:
+                    continue
+            return self.sphere_data
+        except Exception as e:
+            traceback.print_exc()
+            return []
+
+    def generate_points_at_centers(self, geometrical_set_name="Geometry_COG_Points") -> int:
+        if not self.sphere_data:
+            return 0
+        try:
+            part_doc = PartDocument(self.catia_app.active_document.com_object)
+            part = part_doc.part
+            hs_factory = part.hybrid_shape_factory
+            hybrid_bodies = part.hybrid_bodies
+            try:
+                target_hb = hybrid_bodies.item(geometrical_set_name)
+            except:
+                target_hb = hybrid_bodies.add()
+                target_hb.name = geometrical_set_name
+            for data in self.sphere_data:
+                x, y, z = data["_coords"]
+                new_point = hs_factory.add_new_point_coord(x, y, z)
+                new_point.name = f"COG_{data['Name']}"
+                target_hb.append_hybrid_shape(new_point)
+            part.update()
+            return len(self.sphere_data)
+        except Exception as e:
+            print(f"生成点失败: {e}")
+            return 0
+
+    def get_data(self):
+        return self.sphere_data
+
+
+# ── CatiaGunPlacer ──────────────────────────────────────────────────────────
+class CatiaGunPlacer:
+    def __init__(self, catia_app=None):
+        self.catia_app = catia_app
+        self.connection_type = None
+        self.status_message = "就绪"
+        self.gun_template_path = ""
+        self.rotation_order = 'kuka'
+
+    def set_rotation_order(self, order: str):
+        valid_orders = ['kuka', 'catia_zyx', 'catia_xyz']
+        if order in valid_orders:
+            self.rotation_order = order
+
+    def set_catia_app(self, catia_app, connection_type='win32com'):
+        self.catia_app = catia_app
+        self.connection_type = connection_type
+        self.status_message = f"CATIA 已连接 ({connection_type})"
+
+    def is_catia_connected(self) -> bool:
+        if not self.catia_app:
+            return False
+        try:
+            if self.connection_type == 'pycatia':
+                _ = self.catia_app.documents.count
+            else:
+                _ = self.catia_app.Documents.Count
+            return True
+        except:
+            return False
+
+    def has_active_product(self) -> bool:
+        if not self.is_catia_connected():
+            return False
+        try:
+            if self.connection_type == 'pycatia':
+                doc = self.catia_app.active_document
+                return hasattr(doc, 'product')
+            else:
+                doc = self.catia_app.ActiveDocument
+                try:
+                    _ = doc.Product
+                    return True
+                except:
+                    return False
+        except:
+            return False
+
+    def euler_to_rotation_matrix(self, rx, ry, rz, order=None):
+        if order is None:
+            order = self.rotation_order
+        rx_r, ry_r, rz_r = math.radians(rx), math.radians(ry), math.radians(rz)
+        Rx = np.array([[1,0,0],[0,math.cos(rx_r),-math.sin(rx_r)],[0,math.sin(rx_r),math.cos(rx_r)]])
+        Ry = np.array([[math.cos(ry_r),0,math.sin(ry_r)],[0,1,0],[-math.sin(ry_r),0,math.cos(ry_r)]])
+        Rz = np.array([[math.cos(rz_r),-math.sin(rz_r),0],[math.sin(rz_r),math.cos(rz_r),0],[0,0,1]])
+        if order in ('kuka', 'catia_zyx'):
+            return Rz @ Ry @ Rx
+        else:
+            return Rx @ Ry @ Rz
+
+    def euler_to_catia_components(self, x, y, z, rx, ry, rz):
+        R = self.euler_to_rotation_matrix(rx, ry, rz)
+        return [R[0,0],R[1,0],R[2,0], R[0,1],R[1,1],R[2,1], R[0,2],R[1,2],R[2,2], x, y, z]
+
+    def place_guns_batch(self, gun_template, gun_data, progress_callback=None,
+                         correction_values=None, rotation_order=None):
+        if not self.is_catia_connected():
+            QMessageBox.critical(None, "错误", "CATIA 未连接")
+            return 0, 0, []
+        if not self.has_active_product():
+            QMessageBox.critical(None, "错误", "请先打开一个 Product 文档")
+            return 0, 0, []
+        if rotation_order:
+            self.set_rotation_order(rotation_order)
+
+        gun_template_normalized = os.path.normpath(gun_template).replace('/', '\\')
+        success_count, failed_count = 0, 0
+        status_list = []
+
+        try:
+            if self.connection_type == 'pycatia':
+                doc = self.catia_app.active_document
+                product = doc.product
+                products = product.products
+                com_products = products.com_object
+            else:
+                doc = self.catia_app.ActiveDocument
+                product = doc.Product
+                com_products = product.Products
+
+            from datetime import datetime as dt
+            container_name = f"{product.Name if hasattr(product,'Name') else 'Product'}-GUN-{dt.now().strftime('%Y%m%d')}"
+            try:
+                container = com_products.AddNewComponent("Product", container_name)
+                container_products = container.Products
+            except Exception as e:
+                print(f"创建容器失败: {e}")
+                container_products = com_products
+
+            total = len(gun_data)
+            for idx, gun in enumerate(gun_data):
+                try:
+                    x = float(gun.get('X', 0))
+                    y = float(gun.get('Y', 0))
+                    z = float(gun.get('Z', 0))
+                    rx = float(gun.get('Rx', 0))
+                    ry = float(gun.get('Ry', 0))
+                    rz = float(gun.get('Rz', 0))
+
+                    if correction_values:
+                        x += correction_values.get('X', 0)
+                        y += correction_values.get('Y', 0)
+                        z += correction_values.get('Z', 0)
+                        rx += correction_values.get('Rx', 0)
+                        ry += correction_values.get('Ry', 0)
+                        rz += correction_values.get('Rz', 0)
+
+                    file_array = (gun_template_normalized,)
+                    container_products.AddComponentsFromFiles(file_array, "All")
+
+                    import time
+                    time.sleep(0.3)
+
+                    count = container_products.Count
+                    new_product = container_products.Item(count)
+                    new_product.Name = gun.get('Name', f'Gun_{idx+1}')
+
+                    components = self.euler_to_catia_components(x, y, z, rx, ry, rz)
+                    position = new_product.Position
+                    position.SetComponents(components)
+
+                    success_count += 1
+                    status_list.append("✓ 成功")
+                    if progress_callback:
+                        progress_callback(idx + 1, total, f"插入: {gun.get('Name', '')}")
+                except Exception as e:
+                    failed_count += 1
+                    status_list.append(f"✗ {str(e)[:30]}")
+                    print(f"插入第{idx+1}个失败: {e}")
+
+            try:
+                if self.connection_type == 'pycatia':
+                    doc.product.update()
+                else:
+                    doc.Product.Update()
+            except:
+                pass
+
+            self.status_message = f"完成 | 成功: {success_count} | 失败: {failed_count}"
+            return success_count, failed_count, status_list
+        except Exception as e:
+            QMessageBox.critical(None, "批量插入失败", f"发生错误:\n{str(e)}")
+            return success_count, failed_count, status_list
+
+
+# ============================================================================
+# 样式助手
+# ============================================================================
+def _lighten(hex_color: str, factor: float = 1.18) -> str:
+    """将 HEX 颜色调亮，用于 hover 状态。"""
+    h = hex_color.lstrip('#')
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return "#{:02x}{:02x}{:02x}".format(min(255, int(r*factor)),
+                                         min(255, int(g*factor)),
+                                         min(255, int(b*factor)))
+
+def _darken(hex_color: str, factor: float = 0.78) -> str:
+    """将 HEX 颜色调暗，用于 pressed 状态。"""
+    h = hex_color.lstrip('#')
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return "#{:02x}{:02x}{:02x}".format(int(r*factor), int(g*factor), int(b*factor))
+
+def make_btn(text, color, callback=None, width=None, height=None):
+    """创建带悬停/按下变色特效的按钮。"""
+    btn = QPushButton(text)
+    hov = _lighten(color)      # 悬停时变亮
+    prs = _darken(color)       # 按下时变暗
+    btn.setStyleSheet(
+        f"QPushButton {{"
+        f"  background-color: {color}; color: white;"
+        f"  border: none; border-radius: 4px;"
+        f"  padding: 5px 12px; font-size: 13px;"
+        f"}}"
+        f"QPushButton:hover {{"
+        f"  background-color: {hov};"
+        f"  border-bottom: 2px solid {prs};"
+        f"}}"
+        f"QPushButton:pressed {{"
+        f"  background-color: {prs};"
+        f"  border-top: 2px solid {hov};"
+        f"  padding-top: 7px;"
+        f"}}"
+        f"QPushButton:disabled {{"
+        f"  background-color: #aab7b8; color: #ecf0f1;"
+        f"}}"
+    )
+    if callback:
+        btn.clicked.connect(callback)
+    if width:
+        btn.setFixedWidth(width)
+    if height:
+        btn.setFixedHeight(height)
+    return btn
+
+
+# ============================================================================
+# 页面 1：项目路径管理
+# ============================================================================
+class ProjectManagerPage(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.search_paths = []
+        self.df_data = pd.DataFrame(
+            columns=["Company", "Plant", "Area", "Project Name",
+                     "Project Code", "File Name", "Full Path", "System Root"])
+        self.current_preview_pixmap = None
+        self._preview_raw_image = None
+        self._setup_ui()
+        self.load_local_config()
+
+    def _setup_ui(self):
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        # ── 顶部工具栏 ───────────────────────────────────────────────────────
+        toolbar = QFrame()
+        toolbar.setStyleSheet("background-color:#34495e;")
+        toolbar.setFixedHeight(50)
+        tb_layout = QHBoxLayout(toolbar)
+        tb_layout.setContentsMargins(10, 5, 10, 5)
+
+        tb_layout.addWidget(QLabel("🔍 搜索项目:", styleSheet="color:white;"))
+        self.search_edit = QLineEdit()
+        self.search_edit.setFixedWidth(220)
+        self.search_edit.textChanged.connect(self.refresh_tree)
+        tb_layout.addWidget(self.search_edit)
+
+        tb_layout.addWidget(QLabel("  🏢 公司筛选:", styleSheet="color:white;"))
+        self.combo_company = QComboBox()
+        self.combo_company.setFixedWidth(140)
+        self.combo_company.addItem("全部公司")
+        self.combo_company.currentTextChanged.connect(self.refresh_tree)
+        tb_layout.addWidget(self.combo_company)
+
+        tb_layout.addStretch()
+        tb_layout.addWidget(make_btn("打开Catia", "#3498db", self.open_catia))
+        tb_layout.addWidget(make_btn("＋ 添加目录", "#3498db", self.add_search_folder))
+        tb_layout.addWidget(make_btn("🔄 深度扫描", "#27ae60", self.scan_files))
+        tb_layout.addWidget(make_btn("💾 保存修改", "#f1c40f", self.save_config))
+        root_layout.addWidget(toolbar)
+
+        # ── 主体分割 ─────────────────────────────────────────────────────────
+        splitter = QSplitter(Qt.Horizontal)
+
+        # 左侧树
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(4, 4, 4, 4)
+
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(7)
+        self.tree.setHeaderLabels(
+            ["组织架构", "项目代号", "状态", "文件路径", "文件名", "大小", "修改时间"])
+        self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.tree.header().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.tree.itemSelectionChanged.connect(self.on_item_select)
+        self.tree.itemDoubleClicked.connect(lambda item, _: self.launch_pdps())
+
+        # 右键菜单
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._show_tree_context_menu)
+
+        left_layout.addWidget(self.tree)
+        splitter.addWidget(left)
+        splitter.setSizes([900, 300])
+
+        # 右侧详情
+        right = QWidget()
+        right.setStyleSheet("background:#ecf0f1;")
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(12, 8, 12, 8)
+
+        right_layout.addWidget(QLabel("项目预览", styleSheet="font-weight:bold;"))
+        self.lbl_preview = QLabel()
+        self.lbl_preview.setMinimumHeight(160)
+        self.lbl_preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.lbl_preview.setAlignment(Qt.AlignCenter)
+        self.lbl_preview.setStyleSheet("background:black;color:white;border-radius:4px;")
+        self.lbl_preview.setText("无预览图")
+        self._preview_raw_image = None   # 保存原始 PIL Image 供缩放用
+        right_layout.addWidget(self.lbl_preview)
+
+        # 编辑字段
+        self.entries: Dict[str, QLineEdit] = {}
+        form = QFormLayout()
+        for label, key in [("所属公司:", "Company"), ("所在厂房:", "Plant"),
+                            ("所属区域:", "Area"), ("项目名称:", "Project Name"),
+                            ("项目代号:", "Project Code")]:
+            e = QLineEdit()
+            self.entries[key] = e
+            form.addRow(label, e)
+        right_layout.addLayout(form)
+
+        lbl_root = QLabel("System Root (修改将同步同级文件):")
+        lbl_root.setStyleSheet("color:#e67e22;font-weight:bold;")
+        right_layout.addWidget(lbl_root)
+        self.txt_root = QTextEdit()
+        self.txt_root.setFixedHeight(80)
+        self.txt_root.setFont(QFont("Consolas", 9))
+        right_layout.addWidget(self.txt_root)
+
+        right_layout.addWidget(make_btn("🔥 确认修改并同步", "#34495e",
+                                        self.update_metadata_and_sync, height=32))
+        right_layout.addWidget(make_btn("📂 定位文件位置", "#bdc3c7",
+                                        self.open_folder, height=28))
+        right_layout.addStretch()
+        right_layout.addWidget(make_btn("🚀 启动项目", "#27ae60",
+                                        self.launch_pdps, height=42))
+
+        self.status_lbl = QLabel("就绪")
+        self.status_lbl.setStyleSheet("color:#7f8c8d;font-size:11px;")
+        right_layout.addWidget(self.status_lbl)
+
+        splitter.addWidget(right)
+        root_layout.addWidget(splitter)
+
+    # ── 右键菜单 ─────────────────────────────────────────────────────────────
+    def _show_tree_context_menu(self, pos):
+        item = self.tree.itemAt(pos)
+        if item and item.data(0, Qt.UserRole) is not None:
+            menu = QMenu(self)
+            menu.addAction("复制完整路径", self.copy_full_path)
+            menu.addAction("打开所在文件夹", self.open_folder)
+            menu.addSeparator()
+            menu.addAction("查看文件属性", self.show_file_properties)
+            menu.exec_(self.tree.mapToGlobal(pos))
+
+    def copy_full_path(self):
+        item = self._selected_file_item()
+        if item:
+            idx = item.data(0, Qt.UserRole)
+            path = self.df_data.loc[idx, "Full Path"]
+            QApplication.clipboard().setText(path)
+            self.status_lbl.setText(f"已复制: {path}")
+
+    def show_file_properties(self):
+        item = self._selected_file_item()
+        if not item:
+            return
+        idx = item.data(0, Qt.UserRole)
+        row = self.df_data.loc[idx]
+        full_path = row["Full Path"]
+        if os.path.exists(full_path):
+            size = os.path.getsize(full_path)
+            mtime = datetime.fromtimestamp(os.path.getmtime(full_path)).strftime('%Y-%m-%d %H:%M:%S')
+            info = (f"路径: {full_path}\n大小: {size/1024:.2f} KB\n修改时间: {mtime}\n"
+                    f"公司: {row['Company']}\n厂房: {row['Plant']}\n"
+                    f"项目: {row['Project Name']}\n代号: {row['Project Code']}")
+            QMessageBox.information(self, "文件属性", info)
+        else:
+            QMessageBox.warning(self, "警告", "文件不存在")
+
+    def _selected_file_item(self):
+        items = self.tree.selectedItems()
+        if items and items[0].data(0, Qt.UserRole) is not None:
+            return items[0]
+        return None
+
+    # ── 核心逻辑 ─────────────────────────────────────────────────────────────
+    def auto_extract_info(self, psz_path):
+        path_parts = os.path.normpath(psz_path).split(os.sep)
+        psz_dir = os.path.dirname(psz_path)
+        info = {"Company": "", "Plant": "", "Area": "默认区域",
+                "Project Name": "", "Project Code": "", "System Root": ""}
+        try:
+            subfolders = [f for f in os.listdir(psz_dir) if os.path.isdir(os.path.join(psz_dir, f))]
+            if any("library" in f.lower() for f in subfolders):
+                lib = next(f for f in subfolders if "library" in f.lower())
+                info["System Root"] = os.path.normpath(os.path.join(psz_dir, lib))
+                info["Area"] = "项目根目录" if "项目" in os.path.basename(psz_dir) else os.path.basename(psz_dir)
+            else:
+                info["System Root"] = os.path.normpath(os.path.join(psz_dir, ".."))
+        except:
+            pass
+
+        proj_idx = next((i for i, p in enumerate(path_parts) if "项目" in p), -1)
+        comp_idx = next((i for i, p in enumerate(path_parts) if "公司" in p), -1)
+
+        if proj_idx != -1:
+            part = path_parts[proj_idx]
+            bracket = re.search(r'[（(]([^）)]+)[）)]', part)
+            if bracket:
+                info["Project Code"] = bracket.group(1).strip()
+                info["Project Name"] = part[:bracket.start()].strip()
+            else:
+                info["Project Name"] = part
+            if proj_idx > 0:
+                info["Plant"] = path_parts[proj_idx - 1]
+            info["Company"] = path_parts[comp_idx] if comp_idx != -1 else (
+                path_parts[proj_idx - 2] if proj_idx > 1 else "")
+        elif comp_idx != -1:
+            info["Company"] = path_parts[comp_idx]
+            info["Project Name"] = "未识别项目"
+
+        if not info["Company"]: info["Company"] = "通用客户"
+        if not info["Plant"]: info["Plant"] = "未知厂房"
+        if not info["Project Name"]: info["Project Name"] = os.path.basename(psz_path)
+        return info
+
+    def refresh_tree(self):
+        self.tree.clear()
+        df = self.df_data.copy()
+        company_filter = self.combo_company.currentText()
+        if company_filter != "全部公司":
+            df = df[df["Company"] == company_filter]
+        kw = self.search_edit.text().strip().lower()
+        if kw:
+            df = df[df.apply(lambda r: kw in str(r.values).lower(), axis=1)]
+
+        # 更新公司下拉框
+        companies = ["全部公司"] + sorted(self.df_data["Company"].unique().tolist())
+        current = self.combo_company.currentText()
+        self.combo_company.blockSignals(True)
+        self.combo_company.clear()
+        self.combo_company.addItems(companies)
+        idx = self.combo_company.findText(current)
+        self.combo_company.setCurrentIndex(max(0, idx))
+        self.combo_company.blockSignals(False)
+
+        for c, c_grp in df.groupby("Company"):
+            company_node = QTreeWidgetItem(self.tree, [f"🏢 {c}"])
+            company_node.setForeground(0, QColor("#2c3e50"))
+            for p, p_grp in c_grp.groupby("Plant"):
+                plant_node = QTreeWidgetItem(company_node, [f"🏭 {p}"])
+                for pr, pr_grp in p_grp.groupby("Project Name"):
+                    proj_node = QTreeWidgetItem(plant_node, [f"📂 {pr}", pr_grp.iloc[0]["Project Code"]])
+                    for a, a_grp in pr_grp.groupby("Area"):
+                        area_node = QTreeWidgetItem(proj_node, [f"📁 {a}"])
+                        for idx2, row in a_grp.iterrows():
+                            fp = row["Full Path"]
+                            size_str, mtime_str, status = "N/A", "N/A", "Missing"
+                            if os.path.exists(fp):
+                                sz = os.path.getsize(fp)
+                                size_str = f"{sz/1024:.1f} KB" if sz < 1024*1024 else f"{sz/1024/1024:.1f} MB"
+                                mtime_str = datetime.fromtimestamp(os.path.getmtime(fp)).strftime('%Y-%m-%d %H:%M')
+                                status = "Ready"
+                            file_node = QTreeWidgetItem(area_node, [
+                                f"📄 {row['File Name']}", "", status, fp,
+                                row['File Name'], size_str, mtime_str])
+                            file_node.setData(0, Qt.UserRole, idx2)
+                            if status == "Missing":
+                                file_node.setForeground(2, QColor("#e74c3c"))
+                            else:
+                                file_node.setForeground(2, QColor("#27ae60"))
+
+        if kw:
+            self.tree.expandAll()
+
+    def on_item_select(self):
+        item = self._selected_file_item()
+        if not item:
+            return
+        idx = item.data(0, Qt.UserRole)
+        row = self.df_data.loc[idx]
+        for k, e in self.entries.items():
+            e.setText(str(row.get(k, "")))
+        self.txt_root.setPlainText(str(row.get("System Root", "")))
+        self.load_preview(row["Full Path"])
+
+    def update_metadata_and_sync(self):
+        item = self._selected_file_item()
+        if not item:
+            return
+        idx = item.data(0, Qt.UserRole)
+        curr_dir = os.path.dirname(self.df_data.loc[idx, "Full Path"])
+        new_root = self.txt_root.toPlainText().strip()
+        new_values = {k: e.text() for k, e in self.entries.items()}
+        new_values["System Root"] = new_root
+
+        mask = ((self.df_data.index != idx) &
+                (self.df_data["Full Path"].apply(lambda x: os.path.dirname(x)) == curr_dir))
+        sync_indices = self.df_data[mask].index.tolist()
+
+        for col, value in new_values.items():
+            self.df_data.at[idx, col] = value
+            if col in self.df_data.columns and sync_indices:
+                self.df_data.loc[sync_indices, col] = value
+
+        self.refresh_tree()
+        if sync_indices:
+            QMessageBox.information(self, "同步成功", f"已更新同级 {len(sync_indices)} 个文件")
+
+    def open_folder(self):
+        item = self._selected_file_item()
+        if not item:
+            return
+        idx = item.data(0, Qt.UserRole)
+        fp = os.path.normpath(self.df_data.loc[idx, "Full Path"])
+        subprocess.run(['explorer', '/select,', fp])
+
+    def open_catia(self):
+        def get_catia_path():
+            reg_paths = [(r"SOFTWARE\Dassault Systemes\B32\0", "DEST_FOLDER_OSDS"),
+                         (r"SOFTWARE\Dassault Systemes\B28\0", "DEST_FOLDER_OSDS")]
+            for root_key in [winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER]:
+                for rp, val in reg_paths:
+                    try:
+                        with winreg.OpenKey(root_key, rp) as key:
+                            install_dir, _ = winreg.QueryValueEx(key, val)
+                            for exe in [r"code\bin\CNEXT.exe", r"code\bin\CATSTART.exe"]:
+                                p = os.path.join(install_dir, exe)
+                                if os.path.exists(p):
+                                    return p
+                    except:
+                        pass
+            return None
+
+        catia_exe = get_catia_path()
+        if not catia_exe:
+            catia_exe, _ = QFileDialog.getOpenFileName(
+                self, "选择 CATIA 可执行文件",
+                r"C:\Program Files\Dassault Systemes",
+                "Executable (*.exe)")
+            if not catia_exe:
+                return
+        try:
+            subprocess.Popen([catia_exe], cwd=os.path.dirname(catia_exe))
+            QMessageBox.information(self, "成功", "CATIA 正在启动...")
+        except Exception as e:
+            QMessageBox.critical(self, "启动失败", f"无法启动 CATIA:\n{str(e)}")
+
+    def launch_pdps(self):
+        item = self._selected_file_item()
+        if not item:
+            return
+        idx = item.data(0, Qt.UserRole)
+        row = self.df_data.loc[idx]
+        if str(row.get("System Root", "")).strip():
+            try:
+                key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, REG_PATH)
+                winreg.SetValueEx(key, "System Root Path", 0, winreg.REG_SZ, row["System Root"])
+                winreg.CloseKey(key)
+            except Exception as e:
+                print(f"注册表写入失败: {e}")
+        if os.path.exists(row["Full Path"]):
+            os.startfile(row["Full Path"])
+        else:
+            QMessageBox.critical(self, "错误", "文件不存在")
+
+    def scan_files(self):
+        if not self.search_paths:
+            return
+        existing = {row["Full Path"]: row.to_dict() for _, row in self.df_data.iterrows()}
+        new_list = []
+        for bp in self.search_paths:
+            for root, _, files in os.walk(bp):
+                for f in files:
+                    if f.lower().endswith(".psz"):
+                        path = os.path.normpath(os.path.join(root, f))
+                        if path in existing:
+                            new_list.append(existing[path])
+                        else:
+                            rec = {"File Name": f, "Full Path": path}
+                            rec.update(self.auto_extract_info(path))
+                            new_list.append(rec)
+        self.df_data = pd.DataFrame(new_list).drop_duplicates(subset=["Full Path"])
+        self.refresh_tree()
+
+    def load_preview(self, path):
+        self._preview_raw_image = None
+        try:
+            with zipfile.ZipFile(path, 'r') as z:
+                if "Preview Images/previmg.jpg" in z.namelist():
+                    with z.open("Preview Images/previmg.jpg") as f:
+                        self._preview_raw_image = Image.open(f).copy()
+        except Exception as e:
+            print(f"预览图加载失败: {e}")
+        self._update_preview_display()
+
+    def _update_preview_display(self):
+        """根据当前 lbl_preview 的实际宽度缩放并显示预览图。"""
+        if self._preview_raw_image is None:
+            self.lbl_preview.setPixmap(QPixmap())
+            self.lbl_preview.setText("无预览图")
+            return
+        w = max(self.lbl_preview.width(), 100)
+        h = max(int(w * 0.65), 120)          # 保持约 3:2 比例
+        self.lbl_preview.setFixedHeight(h)
+        img = self._preview_raw_image.copy()
+        img.thumbnail((w - 4, h - 4), Image.Resampling.LANCZOS)
+        data = img.convert("RGBA").tobytes("raw", "RGBA")
+        qimg = QImage(data, img.width, img.height, QImage.Format_RGBA8888)
+        self.lbl_preview.setPixmap(QPixmap.fromImage(qimg))
+        self.lbl_preview.setText("")
+
+    def resizeEvent(self, event):
+        """窗口/面板大小变化时同步刷新预览图缩放。"""
+        super().resizeEvent(event)
+        self._update_preview_display()
+
+    def add_search_folder(self):
+        d = QFileDialog.getExistingDirectory(self, "选择搜索目录")
+        if d:
+            self.search_paths.append(d)
+            self.scan_files()
+
+    def save_config(self):
+        self.df_data.to_excel(CONFIG_FILE, index=False)
+        with open("paths_config.ini", "w") as f:
+            f.write(",".join(self.search_paths))
+        QMessageBox.information(self, "保存", "本地数据库已更新")
+
+    def load_local_config(self):
+        if os.path.exists(CONFIG_FILE):
+            self.df_data = pd.read_excel(CONFIG_FILE).fillna("")
+            self.refresh_tree()
+        if os.path.exists("paths_config.ini"):
+            with open("paths_config.ini", "r") as f:
+                self.search_paths = f.read().split(",")
+
+
+# ============================================================================
+# 页面 2：CATIA 工具箱
+# ============================================================================
+class ToolBoxPage(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.catia_app = None
+        self.weld_extractor = CATIAWeldPointExtractor()
+        self.sphere_scanner = CATIASphereScanner()
+        self._setup_ui()
+        self.try_auto_connect_catia()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # 标题栏
+        title_bar = QFrame()
+        title_bar.setStyleSheet("background:#34495e;")
+        title_bar.setFixedHeight(52)
+        tb_layout = QHBoxLayout(title_bar)
+        title_text = "🛠️ CATIA 焊点处理工具"
+        if not PYCATIA_AVAILABLE:
+            title_text += "  ⚠️ pycatia 未安装"
+        lbl = QLabel(title_text)
+        lbl.setStyleSheet("color:white;font-size:15px;font-weight:bold;")
+        tb_layout.addWidget(lbl)
+        layout.addWidget(title_bar)
+
+        # 主体
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        container.setStyleSheet("background:#ecf0f1;")
+        main_layout = QVBoxLayout(container)
+        main_layout.setContentsMargins(30, 20, 30, 20)
+        main_layout.setSpacing(20)
+
+        # ── 工具1：焊点导出 ────────────────────────────────────────────────
+        weld_group = QGroupBox("📍 焊点数据导出")
+        weld_group.setStyleSheet("QGroupBox{font-size:13px;font-weight:bold;}")
+        weld_v = QVBoxLayout(weld_group)
+
+        btn_row1 = QHBoxLayout()
+        btn_row1.addWidget(make_btn("🔗 连接 CATIA", "#3498db", self.connect_catia, height=40))
+        btn_row1.addWidget(make_btn("📊 提取焊点", "#e67e22", self.extract_weld_points, height=40))
+        btn_row1.addWidget(make_btn("💾 导出 Excel", "#27ae60", self.export_welds_to_excel, height=40))
+        btn_row1.addWidget(make_btn("📥 导入数据", "#9b59b6", self.import_weld_data, height=40))
+
+        ball_widget = QWidget()
+        ball_layout = QHBoxLayout(ball_widget)
+        ball_layout.setContentsMargins(0, 0, 0, 0)
+        ball_layout.addWidget(make_btn("💾 生成点球", "#27ae60", self.newball, height=40))
+        self.auto_rename_chk = QCheckBox("按标准自动重命名")
+        ball_layout.addWidget(self.auto_rename_chk)
+        btn_row1.addWidget(ball_widget)
+        btn_row1.addStretch()
+        weld_v.addLayout(btn_row1)
+
+        self.weld_table = QTreeWidget()
+        self.weld_table.setColumnCount(8)
+        self.weld_table.setHeaderLabels(
+            ["Class", "ExternalId", "Name", "Location", "X", "Y", "Z", "Type"])
+        self.weld_table.setFixedHeight(220)
+        self.weld_table.header().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.weld_table.header().setSectionResizeMode(3, QHeaderView.Stretch)
+        weld_v.addWidget(self.weld_table)
+        main_layout.addWidget(weld_group)
+
+        # ── 工具2：几何体重心 ─────────────────────────────────────────────
+        sphere_group = QGroupBox("🔵 几何体重心提取")
+        sphere_group.setStyleSheet("QGroupBox{font-size:13px;font-weight:bold;}")
+        sphere_v = QVBoxLayout(sphere_group)
+
+        btn_row2 = QHBoxLayout()
+        btn_row2.addWidget(make_btn("🔍 扫描所有", "#9b59b6", self.scan_all, height=40))
+        btn_row2.addWidget(make_btn("🎯 扫描选中", "#3498db", self.scan_selected, height=40))
+        btn_row2.addWidget(make_btn("📝 生成重心点", "#e74c3c", self.generate_points, height=40))
+        btn_row2.addWidget(make_btn("💾 导出坐标", "#27ae60", self.export_sphere_coords, height=40))
+        btn_row2.addStretch()
+        sphere_v.addLayout(btn_row2)
+
+        self.sphere_table = QTreeWidget()
+        self.sphere_table.setColumnCount(5)
+        self.sphere_table.setHeaderLabels(["Name", "X", "Y", "Z", "Radius"])
+        self.sphere_table.setFixedHeight(220)
+        self.sphere_table.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        sphere_v.addWidget(self.sphere_table)
+        main_layout.addWidget(sphere_group)
+
+        main_layout.addStretch()
+        scroll.setWidget(container)
+        layout.addWidget(scroll)
+
+        # 状态栏
+        self.status_label = QLabel("就绪 | 使用 pycatia")
+        self.status_label.setStyleSheet(
+            "background:#34495e;color:white;padding:4px 10px;font-size:11px;")
+        layout.addWidget(self.status_label)
+
+    def try_auto_connect_catia(self):
+        try:
+            if PYCATIA_AVAILABLE:
+                self.catia_app = pycatia_catia()
+                conn_type = 'pycatia'
+            else:
+                import win32com.client
+                try:
+                    self.catia_app = win32com.client.GetActiveObject("CATIA.Application")
+                    conn_type = 'win32com'
+                except:
+                    self.status_label.setText("CATIA 未开启")
+                    return
+            self.weld_extractor.set_catia_app(self.catia_app, conn_type)
+            self.sphere_scanner.set_catia_app(self.catia_app)
+            self.status_label.setText(f"CATIA 已连接 ({conn_type})")
+        except:
+            self.status_label.setText("CATIA 未开启")
+
+    def connect_catia(self):
+        try:
+            if PYCATIA_AVAILABLE:
+                self.catia_app = pycatia_catia()
+                conn_type = 'pycatia'
+            else:
+                import win32com.client
+                try:
+                    self.catia_app = win32com.client.GetActiveObject("CATIA.Application")
+                except:
+                    self.catia_app = win32com.client.Dispatch("CATIA.Application")
+                conn_type = 'win32com'
+            self.weld_extractor.set_catia_app(self.catia_app, conn_type)
+            self.sphere_scanner.set_catia_app(self.catia_app)
+            self.status_label.setText(f"已连接 | CATIA ({conn_type})")
+            QMessageBox.information(self, "成功", f"CATIA 连接成功（{conn_type}）")
+        except Exception as e:
+            QMessageBox.critical(self, "失败", f"无法连接 CATIA\n\n{str(e)}")
+
+    def extract_weld_points(self):
+        if not self.catia_app:
+            QMessageBox.warning(self, "警告", "请先连接 CATIA")
+            return
+        self.weld_table.clear()
+        auto_rename = self.auto_rename_chk.isChecked()
+        weld_data = self.weld_extractor.extract_weld_points(auto_rename=auto_rename)
+        for d in weld_data:
+            item = QTreeWidgetItem([
+                d["Class"], d["ExternalId"], d["Name"],
+                d["Location"], str(d["X"]), str(d["Y"]), str(d["Z"]), d["Type"]
+            ])
+            self.weld_table.addTopLevelItem(item)
+        self.status_label.setText(self.weld_extractor.get_status())
+
+    def export_welds_to_excel(self):
+        data = self.weld_extractor.weld_points_data
+        if not data:
+            QMessageBox.warning(self, "警告", "没有数据可导出")
+            return
+        self._export_data(data, "焊点数据.xlsx")
+
+    def import_weld_data(self):
+        fp, _ = QFileDialog.getOpenFileName(
+            self, "选择数据文件", "",
+            "Excel文件 (*.xlsx *.xls);;CSV文件 (*.csv);;所有文件 (*.*)")
+        if not fp:
+            return
+        try:
+            if fp.endswith('.csv'):
+                df = pd.read_csv(fp)
+            else:
+                df = pd.read_excel(fp)
+            cols = df.columns.tolist()
+            x_col = next((c for c in cols if c.upper() in ('X',)), None)
+            y_col = next((c for c in cols if c.upper() in ('Y',)), None)
+            z_col = next((c for c in cols if c.upper() in ('Z',)), None)
+            if not all([x_col, y_col, z_col]):
+                QMessageBox.critical(self, "错误", "文件缺少 X/Y/Z 列")
+                return
+            name_col = next((c for c in cols if c.lower() in ('name', '名称')), None)
+            self.weld_extractor.weld_points_data = []
+            self.weld_table.clear()
+            ok, fail = 0, 0
+            for i, row in df.iterrows():
+                try:
+                    x, y, z = float(row[x_col]), float(row[y_col]), float(row[z_col])
+                    name = str(row[name_col]) if name_col else f"Point_{i+1}"
+                    d = {"Class": "GeoPoint", "ExternalId": name, "Name": name,
+                         "Location": fp, "X": round(x,3), "Y": round(y,3),
+                         "Z": round(z,3), "Type": "RSW"}
+                    self.weld_extractor.weld_points_data.append(d)
+                    self.weld_table.addTopLevelItem(QTreeWidgetItem([
+                        d["Class"], d["ExternalId"], d["Name"],
+                        d["Location"], str(d["X"]), str(d["Y"]), str(d["Z"]), d["Type"]
+                    ]))
+                    ok += 1
+                except:
+                    fail += 1
+            QMessageBox.information(self, "导入成功", f"成功: {ok}，失败: {fail}")
+            self.status_label.setText(f"已导入 {ok} 个焊点")
+        except Exception as e:
+            QMessageBox.critical(self, "导入失败", str(e))
+
+    def newball(self):
+        data = self.weld_extractor.weld_points_data
+        if not data:
+            QMessageBox.warning(self, "警告", "请先提取焊点")
+            return
+        if not self.catia_app:
+            QMessageBox.warning(self, "警告", "请先连接 CATIA")
+            return
+        radius_str, ok = self._simple_input("生成点球", "请输入球体半径 (mm):", "5.0")
+        if not ok:
+            return
+        try:
+            radius = float(radius_str)
+        except:
+            QMessageBox.critical(self, "错误", "请输入有效数字")
+            return
+        QMessageBox.information(self, "功能提示",
+                                f"将为 {len(data)} 个焊点生成半径 {radius}mm 的球体\n(实际生成需要 win32com/pythoncom 支持)")
+
+    def _simple_input(self, title, label, default=""):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        v = QVBoxLayout(dialog)
+        v.addWidget(QLabel(label))
+        edit = QLineEdit(default)
+        v.addWidget(edit)
+        btns = QHBoxLayout()
+        ok_btn = QPushButton("确定")
+        cancel_btn = QPushButton("取消")
+        ok_btn.clicked.connect(dialog.accept)
+        cancel_btn.clicked.connect(dialog.reject)
+        btns.addWidget(ok_btn)
+        btns.addWidget(cancel_btn)
+        v.addLayout(btns)
+        result = dialog.exec_()
+        return edit.text(), result == QDialog.Accepted
+
+    def scan_all(self):
+        if not self.catia_app:
+            QMessageBox.warning(self, "警告", "请先连接 CATIA")
+            return
+        try:
+            data = self.sphere_scanner.scan_all_bodies()
+            self._refresh_sphere_table(data)
+            self.status_label.setText(f"已扫描 {len(data)} 个几何体")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", str(e))
+
+    def scan_selected(self):
+        if not self.catia_app:
+            QMessageBox.warning(self, "警告", "请先连接 CATIA")
+            return
+        try:
+            data = self.sphere_scanner.scan_selected_objects()
+            self._refresh_sphere_table(data)
+            self.status_label.setText(f"已扫描 {len(data)} 个选中几何体")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", str(e))
+
+    def _refresh_sphere_table(self, data):
+        self.sphere_table.clear()
+        for d in data:
+            self.sphere_table.addTopLevelItem(QTreeWidgetItem([
+                d["Name"], d["X"], d["Y"], d["Z"], d["Radius"]]))
+
+    def generate_points(self):
+        if not self.sphere_scanner.get_data():
+            QMessageBox.warning(self, "警告", "请先扫描几何体")
+            return
+        try:
+            count = self.sphere_scanner.generate_points_at_centers()
+            QMessageBox.information(self, "完成", f"已生成 {count} 个重心点")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", str(e))
+
+    def export_sphere_coords(self):
+        sphere_data = self.sphere_scanner.get_data()
+        if not sphere_data:
+            QMessageBox.warning(self, "警告", "没有数据可导出")
+            return
+        export_data = [{k: v for k, v in s.items() if k != "_coords"} for s in sphere_data]
+        self._export_data(export_data, "几何体重心数据.xlsx")
+
+    def _export_data(self, data, default_name):
+        fp, _ = QFileDialog.getSaveFileName(
+            self, "导出数据", default_name,
+            "Excel文件 (*.xlsx);;CSV文件 (*.csv);;所有文件 (*.*)")
+        if not fp:
+            return
+        try:
+            if fp.endswith('.csv'):
+                pd.DataFrame(data).to_csv(fp, index=False, encoding='utf-8-sig')
+            else:
+                pd.DataFrame(data).to_excel(fp, index=False)
+            QMessageBox.information(self, "成功", f"导出完成\n文件: {fp}")
+        except PermissionError:
+            QMessageBox.critical(self, "错误", "文件被占用，请关闭后重试")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", str(e))
+
+
+# ============================================================================
+# 页面 3：插枪工具
+# ============================================================================
+class EditableTableWidget(QTableWidget):
+    """支持 Excel 粘贴的可编辑表格"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_V and event.modifiers() == Qt.ControlModifier:
+            self._paste_from_clipboard()
+        else:
+            super().keyPressEvent(event)
+
+    def _show_context_menu(self, pos):
+        menu = QMenu(self)
+        menu.addAction("📋 粘贴 (Ctrl+V)", self._paste_from_clipboard)
+        menu.addAction("➕ 添加行", self.add_row)
+        menu.addAction("🗑️ 删除行", self.delete_selected_rows)
+        menu.addSeparator()
+        menu.addAction("📊 从Excel文件导入", self._paste_from_excel_file)
+        menu.exec_(self.mapToGlobal(pos))
+
+    def add_row(self):
+        row = self.rowCount()
+        self.insertRow(row)
+        defaults = ["New_Gun", "PmWeldLocationOperation", "0", "0", "0", "0", "0", "0", "待插入"]
+        for col, val in enumerate(defaults):
+            self.setItem(row, col, QTableWidgetItem(val))
+
+    def delete_selected_rows(self):
+        rows = sorted(set(i.row() for i in self.selectedItems()), reverse=True)
+        for r in rows:
+            self.removeRow(r)
+
+    def _paste_from_clipboard(self):
+        text = QApplication.clipboard().text()
+        if not text:
+            return
+        lines = text.strip().split('\n')
+        start_row = self.currentRow() if self.currentRow() >= 0 else self.rowCount()
+        for line in lines:
+            vals = line.split('\t') if '\t' in line else line.split()
+            if len(vals) >= 8:
+                final = vals[:8] + ["待插入"]
+            elif len(vals) >= 7:
+                final = [vals[0], "PmWeldLocationOperation"] + vals[1:7] + ["待插入"]
+            else:
+                while len(vals) < 7:
+                    vals.append("0")
+                final = [vals[0], "PmWeldLocationOperation"] + vals[1:7] + ["待插入"]
+            if start_row >= self.rowCount():
+                self.insertRow(self.rowCount())
+            for col, v in enumerate(final[:9]):
+                self.setItem(start_row, col, QTableWidgetItem(v))
+            start_row += 1
+
+    def _paste_from_excel_file(self):
+        fp, _ = QFileDialog.getOpenFileName(
+            self, "选择 Excel 文件", "",
+            "Excel 文件 (*.xlsx *.xls);;所有文件 (*.*)")
+        if not fp:
+            return
+        try:
+            df = pd.read_excel(fp)
+            required = ['Name', 'X', 'Y', 'Z']
+            missing = [c for c in required if c not in df.columns]
+            if missing:
+                QMessageBox.critical(self, "错误", f"Excel 缺少必需列: {', '.join(missing)}")
+                return
+            self.setRowCount(0)
+            for _, row in df.iterrows():
+                if pd.isna(row['Name']):
+                    continue
+                r = self.rowCount()
+                self.insertRow(r)
+                vals = [
+                    str(row['Name']).strip(),
+                    str(row.get('Type', 'PmWeldLocationOperation')).strip(),
+                    str(row.get('X', 0)), str(row.get('Y', 0)), str(row.get('Z', 0)),
+                    str(row.get('Rx', 0)), str(row.get('Ry', 0)), str(row.get('Rz', 0)),
+                    "待插入"
+                ]
+                for col, v in enumerate(vals):
+                    self.setItem(r, col, QTableWidgetItem(v))
+            QMessageBox.information(self, "成功", f"已导入 {self.rowCount()} 行")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", str(e))
+
+    def get_all_data(self) -> List[Dict]:
+        data = []
+        for r in range(self.rowCount()):
+            try:
+                row = {
+                    'Name':   (self.item(r, 0) or QTableWidgetItem()).text(),
+                    'Type':   (self.item(r, 1) or QTableWidgetItem()).text(),
+                    'X':      float((self.item(r, 2) or QTableWidgetItem("0")).text()),
+                    'Y':      float((self.item(r, 3) or QTableWidgetItem("0")).text()),
+                    'Z':      float((self.item(r, 4) or QTableWidgetItem("0")).text()),
+                    'Rx':     float((self.item(r, 5) or QTableWidgetItem("0")).text()),
+                    'Ry':     float((self.item(r, 6) or QTableWidgetItem("0")).text()),
+                    'Rz':     float((self.item(r, 7) or QTableWidgetItem("0")).text()),
+                    'Status': (self.item(r, 8) or QTableWidgetItem()).text(),
+                }
+                data.append(row)
+            except ValueError:
+                continue
+        return data
+
+    def update_status(self, row_index: int, status: str):
+        if row_index < self.rowCount():
+            self.setItem(row_index, 8, QTableWidgetItem(status))
+
+
+class CatiaGunPlacementPage(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.gun_placer = CatiaGunPlacer()
+        self.catia_app = None
+        self._setup_ui()
+        self.try_auto_connect_catia()
+
+    def _setup_ui(self):
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+
+        # ── 顶部控制区 ────────────────────────────────────────────────────────
+        ctrl_frame = QFrame()
+        ctrl_frame.setStyleSheet("background:#2c3e50;")
+        ctrl_layout = QVBoxLayout(ctrl_frame)
+        ctrl_layout.setContentsMargins(10, 8, 10, 8)
+
+        title = QLabel("🔧 CATIA 焊枪批量插入工具")
+        title.setStyleSheet("color:white;font-size:14px;font-weight:bold;")
+        title.setAlignment(Qt.AlignCenter)
+        ctrl_layout.addWidget(title)
+
+        # 旋转顺序
+        rot_row = QHBoxLayout()
+        rot_row.addWidget(QLabel("旋转顺序:", styleSheet="color:white;"))
+        self.rotation_group = QButtonGroup(self)
+        # 先创建 label，再连接信号，避免 setChecked 触发信号时 label 还不存在
+        self.lbl_rotation_info = QLabel("当前: 库卡 (ZYX)")
+        self.lbl_rotation_info.setStyleSheet("color:#f1c40f;")
+        for text, val in [("库卡 (ZYX)", "kuka"), ("CATIA ZYX", "catia_zyx"), ("CATIA XYZ", "catia_xyz")]:
+            rb = QRadioButton(text)
+            rb.setStyleSheet("color:white;")
+            rb.setProperty("value", val)
+            self.rotation_group.addButton(rb)
+            rot_row.addWidget(rb)
+            if val == "kuka":
+                rb.setChecked(True)  # 在连接信号之前设置默认值
+        # 所有按钮都设置好后再连接信号
+        for btn in self.rotation_group.buttons():
+            btn.toggled.connect(self.on_rotation_order_changed)
+        rot_row.addWidget(self.lbl_rotation_info)
+        rot_row.addStretch()
+        ctrl_layout.addLayout(rot_row)
+
+        # 坐标校正
+        corr_row = QHBoxLayout()
+        corr_row.addWidget(QLabel("坐标校正:", styleSheet="color:white;"))
+        self.corr_edits = {}
+        for label in ["X", "Y", "Z", "Rx", "Ry", "Rz"]:
+            corr_row.addWidget(QLabel(f"{label}:", styleSheet="color:white;"))
+            e = QLineEdit("0.0")
+            e.setFixedWidth(70)
+            self.corr_edits[label] = e
+            corr_row.addWidget(e)
+        corr_row.addWidget(make_btn("应用校正", "#8e44ad", self.apply_correction))
+        corr_row.addWidget(make_btn("清除校正", "#7f8c8d", self.clear_correction))
+        corr_row.addWidget(make_btn("保存配置", "#27ae60", self.save_correction_config))
+        corr_row.addWidget(make_btn("加载配置", "#2980b9", self.load_correction_config))
+        self.lbl_correction_status = QLabel("校正: 未应用")
+        self.lbl_correction_status.setStyleSheet("color:#f1c40f;")
+        corr_row.addWidget(self.lbl_correction_status)
+        ctrl_layout.addLayout(corr_row)
+
+        # 主按钮行
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(make_btn("🔌 连接 CATIA", "#3498db", self.connect_catia))
+        btn_row.addWidget(make_btn("🔫 选择模板", "#e67e22", self.select_gun_template))
+        btn_row.addWidget(make_btn("➕ 添加行", "#27ae60", self.add_row))
+        btn_row.addWidget(make_btn("📋 粘贴Excel", "#16a085", self.paste_excel))
+        btn_row.addWidget(make_btn("🧪 测试插入", "#9b59b6", self.test_single_insert))
+        start_btn = make_btn("🚀 批量插入", "#e74c3c", self.start_batch_placement)
+        start_btn.setStyleSheet(start_btn.styleSheet() + "font-weight:bold;font-size:14px;")
+        btn_row.addWidget(start_btn)
+        btn_row.addStretch()
+        ctrl_layout.addLayout(btn_row)
+
+        tip = QLabel("💡 提示: 双击单元格编辑 | 右键粘贴数据 | Ctrl+V 快速粘贴 | 支持从 Excel 复制粘贴")
+        tip.setStyleSheet("color:#ecf0f1;font-size:10px;")
+        ctrl_layout.addWidget(tip)
+        root_layout.addWidget(ctrl_frame)
+
+        # ── 主体：左表 + 右面板 ───────────────────────────────────────────────
+        splitter = QSplitter(Qt.Horizontal)
+
+        # 左侧数据表
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(4, 4, 4, 4)
+        left_layout.addWidget(QLabel("📋 插枪数据 (可编辑)",
+                                      styleSheet="font-size:12px;font-weight:bold;"))
+
+        self.data_table = EditableTableWidget()
+        self.data_table.setColumnCount(9)
+        self.data_table.setHorizontalHeaderLabels(
+            ["名称", "类型", "X", "Y", "Z", "Rx (°)", "Ry (°)", "Rz (°)", "状态"])
+        self.data_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.data_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.data_table.horizontalHeader().setSectionResizeMode(8, QHeaderView.ResizeToContents)
+        self.data_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.data_table.setAlternatingRowColors(True)
+        left_layout.addWidget(self.data_table)
+        splitter.addWidget(left)
+
+        # 右侧配置
+        right = QWidget()
+        right.setStyleSheet("background:#ecf0f1;")
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(12, 8, 12, 8)
+
+        # 配置
+        config_group = QGroupBox("⚙️ 文件路径")
+        config_v = QVBoxLayout(config_group)
+        config_v.addWidget(QLabel("焊枪模板:"))
+        self.lbl_template = QLabel("未选择")
+        self.lbl_template.setStyleSheet("background:white;border:1px solid #ccc;padding:4px;")
+        self.lbl_template.setWordWrap(True)
+        config_v.addWidget(self.lbl_template)
+        right_layout.addWidget(config_group)
+
+        # 统计
+        stats_group = QGroupBox("📊 统计信息")
+        stats_v = QVBoxLayout(stats_group)
+        self.lbl_total = QLabel("总数: 0")
+        self.lbl_success = QLabel("成功: 0")
+        self.lbl_success.setStyleSheet("color:green;")
+        self.lbl_failed = QLabel("失败: 0")
+        self.lbl_failed.setStyleSheet("color:red;")
+        for l in [self.lbl_total, self.lbl_success, self.lbl_failed]:
+            stats_v.addWidget(l)
+        right_layout.addWidget(stats_group)
+
+        # 类型筛选
+        filter_group = QGroupBox("🔽 插入筛选")
+        filter_v = QVBoxLayout(filter_group)
+        self.filter_all = QCheckBox("✓ 插入全部点")
+        self.filter_all.setChecked(True)
+        self.filter_all.toggled.connect(self.on_filter_all_changed)
+        self.filter_weld = QCheckBox("🔥 仅插入焊点 (PmWeldLocationOperation)")
+        self.filter_weld.toggled.connect(self.on_filter_type_changed)
+        self.filter_via = QCheckBox("🔄 仅插入过渡点 (PmViaLocationOperation)")
+        self.filter_via.toggled.connect(self.on_filter_type_changed)
+        self.filter_continuous = QCheckBox("➰ 仅插入连续点 (PmContinuousFeatureOperation)")
+        self.filter_continuous.toggled.connect(self.on_filter_type_changed)
+        for w in [self.filter_all, self.filter_weld, self.filter_via, self.filter_continuous]:
+            filter_v.addWidget(w)
+        self.lbl_filter_info = QLabel("当前: 插入全部点")
+        self.lbl_filter_info.setStyleSheet("color:#2980b9;font-size:10px;")
+        filter_v.addWidget(self.lbl_filter_info)
+        right_layout.addWidget(filter_group)
+
+        # 进度
+        right_layout.addWidget(QLabel("📊 执行进度", styleSheet="font-weight:bold;"))
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        right_layout.addWidget(self.progress_bar)
+        self.lbl_progress = QLabel("等待开始...")
+        self.lbl_progress.setStyleSheet("color:#7f8c8d;font-size:10px;")
+        right_layout.addWidget(self.lbl_progress)
+
+        # 日志
+        right_layout.addWidget(QLabel("📝 操作日志", styleSheet="font-weight:bold;"))
+        self.log_text = QPlainTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setFont(QFont("Consolas", 9))
+        self.log_text.setMaximumBlockCount(500)
+        right_layout.addWidget(self.log_text)
+
+        right_layout.addWidget(make_btn("❓ 使用说明", "#95a5a6", self.show_help))
+
+        self.status_label = QLabel("就绪")
+        self.status_label.setStyleSheet(
+            "background:#34495e;color:white;padding:4px 8px;font-size:10px;")
+        right_layout.addWidget(self.status_label)
+
+        splitter.addWidget(right)
+        splitter.setSizes([850, 350])
+        root_layout.addWidget(splitter)
+
+        # 加载示例数据
+        self.add_sample_data()
+
+    def add_sample_data(self):
+        samples = [
+            ("Gun_001", "PmWeldLocationOperation", "100.0", "200.0", "300.0", "0", "0", "90", "待插入"),
+            ("Via_001", "PmViaLocationOperation",  "150.0", "250.0", "350.0", "0", "45", "0", "待插入"),
+            ("Gun_002", "PmWeldLocationOperation", "200.0", "300.0", "400.0", "30", "0", "0", "待插入"),
+        ]
+        for vals in samples:
+            r = self.data_table.rowCount()
+            self.data_table.insertRow(r)
+            for col, v in enumerate(vals):
+                self.data_table.setItem(r, col, QTableWidgetItem(v))
+
+    # ── 旋转顺序 ──────────────────────────────────────────────────────────────
+    def on_rotation_order_changed(self):
+        for btn in self.rotation_group.buttons():
+            if btn.isChecked():
+                order = btn.property("value")
+                self.gun_placer.set_rotation_order(order)
+                names = {'kuka': '库卡 (ZYX)', 'catia_zyx': 'CATIA ZYX', 'catia_xyz': 'CATIA XYZ'}
+                self.lbl_rotation_info.setText(f"当前: {names.get(order, order)}")
+                self.log(f"旋转顺序切换为: {names.get(order, order)}")
+                break
+
+    # ── 坐标校正 ──────────────────────────────────────────────────────────────
+    def get_correction_values(self):
+        try:
+            return {k: float(e.text() or 0) for k, e in self.corr_edits.items()}
+        except:
+            return {k: 0 for k in self.corr_edits}
+
+    def apply_correction(self):
+        corr = self.get_correction_values()
+        data = self.data_table.get_all_data()
+        if not data:
+            QMessageBox.warning(self, "警告", "没有数据可应用校正")
+            return
+        for r in range(self.data_table.rowCount()):
+            try:
+                x = float((self.data_table.item(r, 2) or QTableWidgetItem("0")).text()) + corr["X"]
+                y = float((self.data_table.item(r, 3) or QTableWidgetItem("0")).text()) + corr["Y"]
+                z = float((self.data_table.item(r, 4) or QTableWidgetItem("0")).text()) + corr["Z"]
+                rx = float((self.data_table.item(r, 5) or QTableWidgetItem("0")).text()) + corr["Rx"]
+                ry = float((self.data_table.item(r, 6) or QTableWidgetItem("0")).text()) + corr["Ry"]
+                rz = float((self.data_table.item(r, 7) or QTableWidgetItem("0")).text()) + corr["Rz"]
+                for col, val in zip([2,3,4,5,6,7], [x,y,z,rx,ry,rz]):
+                    self.data_table.setItem(r, col, QTableWidgetItem(str(round(val, 3))))
+                self.data_table.setItem(r, 8, QTableWidgetItem("已校正"))
+            except:
+                continue
+        self.lbl_correction_status.setText(f"校正已应用: {corr}")
+        self.log(f"✅ 坐标校正已应用到 {len(data)} 行")
+
+    def clear_correction(self):
+        for e in self.corr_edits.values():
+            e.setText("0.0")
+        self.lbl_correction_status.setText("校正: 已清除")
+        self.log("🔄 坐标校正已清除")
+
+    def save_correction_config(self):
+        config = {k: e.text() for k, e in self.corr_edits.items()}
+        config['gun_template'] = self.gun_placer.gun_template_path
+        config_dir = os.path.join(os.path.expanduser("~"), ".catia_gun_tool")
+        os.makedirs(config_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fp = os.path.join(config_dir, f"correction_config_{ts}.json")
+        with open(fp, 'w', encoding='utf-8') as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+        QMessageBox.information(self, "成功", f"配置已保存到:\n{fp}")
+        self.log(f"✅ 配置已保存: {fp}")
+
+    def load_correction_config(self):
+        fp, _ = QFileDialog.getOpenFileName(
+            self, "选择配置文件", "", "JSON 文件 (*.json);;所有文件 (*.*)")
+        if not fp:
+            return
+        try:
+            with open(fp, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+            for k, e in self.corr_edits.items():
+                if k in config:
+                    e.setText(str(config[k]))
+            if 'gun_template' in config and os.path.exists(config['gun_template']):
+                self.gun_placer.gun_template_path = config['gun_template']
+                self.lbl_template.setText(config['gun_template'])
+            self.lbl_correction_status.setText("校正: 已加载配置")
+            self.log(f"✅ 配置已加载: {os.path.basename(fp)}")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"加载配置失败:\n{str(e)}")
+
+    # ── 筛选逻辑 ──────────────────────────────────────────────────────────────
+    def on_filter_all_changed(self, checked):
+        if checked:
+            self.filter_weld.setChecked(False)
+            self.filter_via.setChecked(False)
+            self.filter_continuous.setChecked(False)
+            self.lbl_filter_info.setText("当前: 插入全部点")
+
+    def on_filter_type_changed(self):
+        any_checked = (self.filter_weld.isChecked() or
+                       self.filter_via.isChecked() or
+                       self.filter_continuous.isChecked())
+        if any_checked:
+            self.filter_all.setChecked(False)
+            selected = []
+            if self.filter_weld.isChecked(): selected.append("焊点")
+            if self.filter_via.isChecked(): selected.append("过渡点")
+            if self.filter_continuous.isChecked(): selected.append("连续点")
+            self.lbl_filter_info.setText(f"当前: 插入 {'+'.join(selected)}")
+        else:
+            self.filter_all.setChecked(True)
+            self.lbl_filter_info.setText("当前: 插入全部点")
+
+    # ── CATIA 连接 ────────────────────────────────────────────────────────────
+    def try_auto_connect_catia(self):
+        try:
+            if PYCATIA_AVAILABLE:
+                self.catia_app = pycatia_catia()
+                conn_type = 'pycatia'
+            else:
+                import win32com.client
+                self.catia_app = win32com.client.GetActiveObject("CATIA.Application")
+                conn_type = 'win32com'
+            self.gun_placer.set_catia_app(self.catia_app, conn_type)
+            self.status_label.setText(f"✅ CATIA 已连接 ({conn_type})")
+        except:
+            self.status_label.setText("CATIA 未开启")
+
+    def connect_catia(self):
+        try:
+            if PYCATIA_AVAILABLE:
+                self.catia_app = pycatia_catia()
+                conn_type = 'pycatia'
+            else:
+                import win32com.client
+                try:
+                    self.catia_app = win32com.client.GetActiveObject("CATIA.Application")
+                except:
+                    self.catia_app = win32com.client.Dispatch("CATIA.Application")
+                conn_type = 'win32com'
+            self.gun_placer.set_catia_app(self.catia_app, conn_type)
+            self.status_label.setText(f"✅ CATIA 已连接 ({conn_type})")
+            QMessageBox.information(self, "成功", f"CATIA 连接成功（{conn_type}）")
+        except Exception as e:
+            QMessageBox.critical(self, "连接失败", f"无法连接 CATIA\n\n{str(e)}")
+
+    def select_gun_template(self):
+        fp, _ = QFileDialog.getOpenFileName(
+            self, "选择焊枪模板文件", "",
+            "CATIA 文件 (*.CATPart *.CATProduct *.cgr);;所有文件 (*.*)")
+        if fp:
+            self.gun_placer.gun_template_path = fp
+            self.lbl_template.setText(fp)
+            self.log(f"✅ 已选择模板: {os.path.basename(fp)}")
+
+    def add_row(self):
+        self.data_table.add_row()
+        self._update_statistics()
+
+    def paste_excel(self):
+        self.data_table._paste_from_excel_file()
+        self._update_statistics()
+
+    def _update_statistics(self):
+        self.lbl_total.setText(f"总数: {self.data_table.rowCount()}")
+
+    def progress_callback(self, current, total, message):
+        pct = int((current / max(1, total)) * 100)
+        self.progress_bar.setValue(pct)
+        self.lbl_progress.setText(f"{message} ({current}/{total})")
+        self.log(message)
+        QApplication.processEvents()
+
+    def log(self, text: str):
+        self.log_text.appendPlainText(text)
+
+    def test_single_insert(self):
+        if not self.gun_placer.is_catia_connected():
+            QMessageBox.warning(self, "警告", "请先连接 CATIA")
+            return
+        if not self.gun_placer.gun_template_path:
+            QMessageBox.warning(self, "警告", "请先选择焊枪模板文件")
+            return
+        tp = os.path.normpath(self.gun_placer.gun_template_path).replace('/', '\\')
+        self.log("=" * 40)
+        self.log("🧪 开始测试插入...")
+        self.log(f"模板文件: {tp}")
+        self.log(f"文件存在: {os.path.exists(tp)}")
+        try:
+            sz = os.path.getsize(tp) / 1024
+            self.log(f"文件大小: {sz:.2f} KB")
+        except:
+            pass
+        self.log("（测试完成，实际插入请点击批量插入）")
+
+    def start_batch_placement(self):
+        if not self.gun_placer.is_catia_connected():
+            QMessageBox.warning(self, "警告", "请先连接 CATIA")
+            return
+        if not self.gun_placer.has_active_product():
+            QMessageBox.warning(self, "警告", "请在 CATIA 中打开一个 Product 文档")
+            return
+        if not self.gun_placer.gun_template_path:
+            QMessageBox.warning(self, "警告", "请先选择焊枪模板文件")
+            return
+
+        all_gun_data = self.data_table.get_all_data()
+        if not all_gun_data:
+            QMessageBox.warning(self, "警告", "没有有效的插枪数据")
+            return
+
+        correction_values = self.get_correction_values()
+        apply_correction = any(v != 0 for v in correction_values.values())
+        rotation_order = None
+        for btn in self.rotation_group.buttons():
+            if btn.isChecked():
+                rotation_order = btn.property("value")
+                break
+
+        # 筛选
+        if self.filter_all.isChecked():
+            gun_data = all_gun_data
+            filter_desc = "全部点"
+        else:
+            selected_types = []
+            if self.filter_weld.isChecked(): selected_types.append("PmWeldLocationOperation")
+            if self.filter_via.isChecked(): selected_types.append("PmViaLocationOperation")
+            if self.filter_continuous.isChecked(): selected_types.append("PmContinuousFeatureOperation")
+            if not selected_types:
+                QMessageBox.warning(self, "警告", "请至少选择一种点类型")
+                return
+            gun_data = [g for g in all_gun_data if g['Type'] in selected_types]
+            filter_desc = " + ".join(filter(None, [
+                "焊点" if self.filter_weld.isChecked() else None,
+                "过渡点" if self.filter_via.isChecked() else None,
+                "连续点" if self.filter_continuous.isChecked() else None,
+            ]))
+
+        if not gun_data:
+            QMessageBox.warning(self, "警告", f"筛选后没有数据\n当前筛选: {filter_desc}")
+            return
+
+        confirm_msg = (f"即将插入 {len(gun_data)} 个组件（共 {len(all_gun_data)} 个）\n"
+                       f"筛选条件: {filter_desc}\n"
+                       f"模板: {os.path.basename(self.gun_placer.gun_template_path)}\n")
+        if apply_correction:
+            confirm_msg += f"坐标校正: {correction_values}\n"
+        confirm_msg += "\n是否继续?"
+        if QMessageBox.question(self, "确认", confirm_msg) != QMessageBox.Yes:
+            return
+
+        self.progress_bar.setValue(0)
+        self.lbl_success.setText("成功: 0")
+        self.lbl_failed.setText("失败: 0")
+        self.log("=" * 40)
+        self.log(f"🚀 开始批量插入 ({filter_desc})...")
+
+        success, failed, status_list = self.gun_placer.place_guns_batch(
+            self.gun_placer.gun_template_path, gun_data,
+            self.progress_callback,
+            correction_values if apply_correction else None,
+            rotation_order
+        )
+
+        # 更新状态列
+        gun_data_set = set(id(g) for g in gun_data)
+        s_idx = 0
+        for a_idx, gun in enumerate(all_gun_data):
+            if gun in gun_data and s_idx < len(status_list):
+                self.data_table.update_status(a_idx, status_list[s_idx])
+                s_idx += 1
+
+        self.lbl_success.setText(f"成功: {success}")
+        self.lbl_failed.setText(f"失败: {failed}")
+        self.log(f"✅ 完成 | 成功: {success} | 失败: {failed}")
+        QMessageBox.information(self, "完成",
+                                f"批量插入完成!\n成功: {success}\n失败: {failed}")
+
+    def show_help(self):
+        help_text = """📖 CATIA 焊枪批量插入工具使用说明
+
+1️⃣ 数据输入方式
+  • 双击单元格直接编辑
+  • 点击"添加行"添加新数据
+  • Ctrl+V 粘贴 Excel 数据
+  • 右键选择"从Excel文件导入"
+
+2️⃣ 数据格式
+  Name | Type | X | Y | Z | Rx | Ry | Rz
+
+3️⃣ 点类型
+  PmWeldLocationOperation     → 焊点
+  PmViaLocationOperation      → 过渡点
+  PmContinuousFeatureOperation → 连续点
+
+4️⃣ 操作流程
+  ① 打开 CATIA，创建/打开 Product 文档
+  ② 点击"连接 CATIA"
+  ③ 点击"选择模板"，选择焊枪文件
+  ④ 输入或粘贴插枪数据
+  ⑤ 选择要插入的点类型（筛选）
+  ⑥ 点击"批量插入"
+
+5️⃣ 注意事项
+  • 模板文件路径不要包含中文字符
+  • 插入过程中不要操作 CATIA
+  • 欧拉角采用 ZYX 旋转顺序（库卡标准）"""
+        msg = QMessageBox(self)
+        msg.setWindowTitle("使用说明")
+        msg.setText(help_text)
+        msg.setTextFormat(Qt.PlainText)
+        msg.exec_()
+
+
+# ============================================================================
+# 主窗口
+# ============================================================================
+class MainApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Tecnomatix PDPS 综合集成工作站 V13.0 (PyQt5)")
+        self.resize(1300, 800)
+        self.setWindowIcon(QIcon("LOGO.ico"))
+        self._setup_ui()
+
+    def _setup_ui(self):
+        self.tab_widget = QTabWidget()
+        self.tab_widget.setStyleSheet("""
+            QTabBar::tab {
+                font-family: 微软雅黑; font-size: 12px;
+                padding: 8px 20px; min-width: 120px;
+            }
+            QTabBar::tab:selected { background: #3498db; color: white; }
+            QTabBar::tab:!selected { background: #ecf0f1; color: #2c3e50; }
+        """)
+
+        self.page_manager = ProjectManagerPage()
+        self.page_toolbox = ToolBoxPage()
+        self.page_gun = CatiaGunPlacementPage()
+
+        self.tab_widget.addTab(self.page_manager, "📂 项目路径管理")
+        self.tab_widget.addTab(self.page_toolbox, "🛠️ Catia工具箱")
+        self.tab_widget.addTab(self.page_gun, "🔧 插枪工具")
+
+        self.setCentralWidget(self.tab_widget)
+
+        # 状态栏
+        self.statusBar().showMessage("就绪 | 请选择功能模块")
+        self.statusBar().setStyleSheet("font-family:微软雅黑;font-size:10px;")
+
+
+# ============================================================================
+# 入口
+# ============================================================================
+def main():
+    # DPI 感知
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+    # 高 DPI 支持必须在 QApplication 创建之前设置
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+
+    app = QApplication(sys.argv)
+    app.setStyle(QStyleFactory.create("Fusion"))
+
+    # 全局字体
+    font = QFont("微软雅黑", 10)
+    app.setFont(font)
+
+    window = MainApp()
+    window.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
