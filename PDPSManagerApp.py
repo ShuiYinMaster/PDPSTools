@@ -1,4 +1,4 @@
-2# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Tecnomatix PDPS 工具箱启动器。
 
 将本文件所在目录加入模块搜索路径，

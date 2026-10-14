@@ -1,0 +1,46 @@
+name: Windows checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-package:
+    runs-on: windows-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13.3'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements-build.txt
+      - name: Run regression tests
+        run: python -B -m unittest discover -s tests -v
+      - name: Build Windows executable
+        run: python -m PyInstaller --noconfirm --clean --distpath "${{ runner.temp }}/pdps-dist" --workpath "${{ runner.temp }}/pdps-build" PDPSTools.spec
+      - name: Smoke test packaged app
+        shell: pwsh
+        working-directory: ${{ runner.temp }}/pdps-dist
+        run: |
+          $exe = Join-Path (Get-Location) 'PDPSTools.exe'
+          if (-not (Test-Path -LiteralPath $exe)) {
+            throw 'PDPSTools.exe was not created'
+          }
+          $app = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 5
+          $app.Refresh()
+          if ($app.HasExited) {
+            throw "PDPSTools.exe exited during startup with code $($app.ExitCode)"
+          }
+          Stop-Process -Id $app.Id -Force
+          Wait-Process -Id $app.Id -ErrorAction SilentlyContinue

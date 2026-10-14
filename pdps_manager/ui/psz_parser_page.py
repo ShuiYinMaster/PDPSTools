@@ -65,7 +65,7 @@ class PszParserPage(QWidget):
         self.content = None          # 兼容字段：指向第一个条目（PS 优先）的 XML 文本
         self.contents = {}           # entry -> XML 文本（PS / EMS）
         self.encs = {}               # entry -> 编码
-        self.objects = {}            # ext_id -> ObjInfo（合并）
+        self.objects = {}            # (entry, ext_id) -> ObjInfo
         self.entry_objects = {}      # entry -> {ext_id: ObjInfo}
         self.dup = []
         self.obj_list = []           # 排序后的对象列表
@@ -74,6 +74,7 @@ class PszParserPage(QWidget):
         self.xml_violations = []     # [{"line","column","start","context","entry"}, ...]
         self.entry_stats = {}        # entry -> {"objects","broken","dangling"}
         self.entry_count = 0
+        self.fingerprint = None      # loaded PSZ content fingerprint
         self._current_rows = []      # 表格当前行 -> ObjInfo
         self._current_kv_rows = []   # 当前选中对象的 KV 行（未过滤）
         self._worker = None          # 当前后台线程
@@ -161,12 +162,13 @@ class PszParserPage(QWidget):
         filter_row.addWidget(self.lbl_obj_count)
         ll.addLayout(filter_row)
 
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["类型", "名称", "外部ID", "顶层"])
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["类型", "名称", "外部ID", "条目", "顶层"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -287,6 +289,9 @@ class PszParserPage(QWidget):
 
     def load_file(self, path):
         """公开入口：加载一个 .psz（供项目路径管理集成调用）。"""
+        if self._worker is not None and self._worker.isRunning():
+            self.status_lbl.setText("当前任务尚未结束，请稍后再解析")
+            return
         path = os.path.normpath(path) if path else ""
         if not path or not os.path.exists(path):
             QMessageBox.warning(self, "警告", "文件不存在:\n" + path)
@@ -333,6 +338,7 @@ class PszParserPage(QWidget):
         self.obj_list = snap["obj_list"]
         self.entry_stats = snap["entry_stats"]
         self.entry_count = snap["entry_count"]
+        self.fingerprint = snap["fingerprint"]
         self._clear_detail()
         self._refresh_summary()
         self._populate_type_list()
@@ -387,7 +393,8 @@ class PszParserPage(QWidget):
                 continue
             if type_f and o.tag != type_f:
                 continue
-            if kw and not (kw in o.ext_id.lower() or (o.name and kw in o.name.lower())):
+            if kw and not (kw in o.ext_id.lower() or (o.name and kw in o.name.lower())
+                           or kw in _entry_tag(o.entry).lower()):
                 continue
             rows.append(o)
         self._current_rows = rows
@@ -396,7 +403,8 @@ class PszParserPage(QWidget):
         self.table.setRowCount(len(rows))
         try:
             for r, o in enumerate(rows):
-                vals = (o.tag, o.name or "-", o.ext_id, "✓" if o.top_level else "")
+                vals = (o.tag, o.name or "-", o.ext_id,
+                        _entry_tag(o.entry), "✓" if o.top_level else "")
                 for c, v in enumerate(vals):
                     self.table.setItem(r, c, QTableWidgetItem(v))
         finally:
@@ -500,12 +508,19 @@ class PszParserPage(QWidget):
             QMessageBox.warning(self, "提示", "请先在列表中选中一个对象")
             return
         o = self._current_rows[row]
+        same_id_elsewhere = any(
+            o.ext_id in objects for entry, objects in self.entry_objects.items()
+            if entry != o.entry)
+        reference_note = (
+            "另一个条目仍有相同 ID 的对象，相关引用会保留。"
+            if same_id_elsewhere else "没有同 ID 对象留存时会清理相关 Pm*Usage。")
         msg = (f"将删除对象：\n<{o.tag}> 名称={o.name or '-'}  ID={o.ext_id}\n"
                f"所属条目: {_entry_tag(o.entry)}\n\n"
-               "同时清理引用它的 Pm*Usage，并自动备份原文件。\n是否继续？")
+               f"{reference_note}\n将自动备份原文件。\n是否继续？")
         if QMessageBox.question(self, "确认删除", msg) != QMessageBox.Yes:
             return
-        self._start_repair("delete", {"ids": [o.ext_id], "clean": True, "backup": True})
+        self._start_repair("delete", {"targets": [(o.entry, o.ext_id)],
+                                      "clean": True, "backup": True})
 
     def _delete_broken(self):
         if not self.broken_3d:
@@ -514,7 +529,7 @@ class PszParserPage(QWidget):
         lines = [f"[{_entry_tag(entry)}] <{tag}> {name or '-'}  id={eid}"
                  for eid, tag, name, _, entry in self.broken_3d]
         intro = ("以下对象 threeDRep 指向 TuneTbm-（断裂，zip 内无资源），将被删除。\n"
-                 "会同时清理 PsState 与 EmsState 中引用它们的 Pm*Usage，并自动备份原文件。")
+                 "仅清理不再由任一条目对象使用的引用，并自动备份原文件。")
         dlg = ScrollableMessageBox(
             title="确认批量删除",
             intro=intro,
@@ -564,9 +579,13 @@ class PszParserPage(QWidget):
         self._start_repair("rebuild", {"xml_path": fp})
 
     def _start_repair(self, mode, params):
+        if self._worker is not None and self._worker.isRunning():
+            self.status_lbl.setText("当前任务尚未结束，请稍后再修改")
+            return
         self.status_lbl.setText("正在执行并重新解析…")
         self._set_busy(True)
-        w = PszRepairWorker(self.psz_path, self.contents, self.encs, mode, params, self)
+        w = PszRepairWorker(self.psz_path, self.contents, self.encs, mode, params,
+                            self, expected_fingerprint=self.fingerprint)
         w.done.connect(self._on_repair_done)
         w.failed.connect(self._on_repair_failed)
         w.finished.connect(self._cleanup_worker)
@@ -576,8 +595,8 @@ class PszParserPage(QWidget):
     def _on_repair_done(self, snapshot):
         self._apply_snapshot(snapshot)
         self._set_busy(False)
-        bak = self.psz_path + ".bak"
-        extra = f"\n备份文件: {os.path.basename(bak)}" if os.path.exists(bak) else ""
+        bak = snapshot.get("backup_path")
+        extra = f"\n备份文件: {bak}" if bak else ""
         self.status_lbl.setText("操作完成")
         QMessageBox.information(self, "完成", f"操作完成，已重新解析。{extra}")
 
@@ -600,7 +619,8 @@ class PszParserPage(QWidget):
             QApplication.restoreOverrideCursor()
 
     def _cleanup_worker(self):
-        w = self._worker
+        w = self.sender()
         if w is not None:
             w.deleteLater()
-            self._worker = None
+            if w is self._worker:
+                self._worker = None

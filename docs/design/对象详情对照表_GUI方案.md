@@ -1,7 +1,8 @@
 # 对象详情面板 · 对照表方案（GUI 改造）
 
 > 目标：把当前右侧"对象详情 (XML)"面板里挤成一坨的原始 XML 文本，改成可读的对照表。
-> 数据接口：见 `demo_obj_table.py`，核心输出是 `to_kv_table(obj)` 返回的扁平行列表。
+> 状态：历史设计参考；生产实现位于 `pdps_manager/core/obj_kv_table.py`，界面接入位于 `pdps_manager/ui/psz_parser_page.py`。
+> 数据接口：核心输出是 `to_kv_table(obj)` 返回的扁平行列表；以下方案示例不代表全部已经实现。
 > 推荐实现：方案 A（分组 KV 表）。
 
 ---
@@ -195,7 +196,7 @@ rows = to_kv_table(parsed_obj)
 
 ## 八、参考代码（Python，可翻译到任意语言）
 
-`demo_obj_table.py` 里的核心函数：
+`pdps_manager/core/obj_kv_table.py` 里的核心函数：
 
 ```python
 def to_kv_table(d):
@@ -227,7 +228,7 @@ def _flatten(children, parent_path, section, rows):
                 _flatten(item['children'], path, section, rows)
 ```
 
-完整可运行示例（含 ASCII 预览）见 `demo_obj_table.py`。
+生产解析器与 ASCII 预览函数见 `pdps_manager/core/obj_kv_table.py`。
 
 ---
 

@@ -51,12 +51,15 @@ PSZ 解析器 - Process Simulate 工程文件 (.psz) 解析与编辑工具
 """
 
 import argparse
+import hashlib
 import html
 import ntpath
 import os
 import re
 import shutil
 import sys
+import tempfile
+import uuid
 import zipfile
 import xml.etree.ElementTree as ET
 from collections import Counter
@@ -428,18 +431,14 @@ def check_broken_entries(contents: dict, per_entry_objects: dict, all_objects: d
     参数:
       contents          {entry名: XML文本}（PS_STATE / EMS_STATE）
       per_entry_objects {entry名: {ext_id: ObjInfo}}，每个条目自己扫描的结果
-      all_objects       可选的合并对象字典（用于跨条目判断 <uses> 悬空）
+      all_objects       保留兼容参数；ID 集合始终来自 per_entry_objects 的并集
 
     返回 (broken_3d, dangling_uses, entry_stats):
       broken_3d   5 元组列表 (ext_id, tag, name, tbm, entry)，带来源条目
       dangling_uses  [(uid, pos), ...]（pos 相对各自条目文本）
       entry_stats {entry: {"objects": n, "broken": n, "dangling": n}}
     """
-    if all_objects is None:
-        all_objects = {}
-        for objs in per_entry_objects.values():
-            all_objects.update(objs)
-    all_ids = set(all_objects.keys())
+    all_ids = {eid for objs in per_entry_objects.values() for eid in objs}
     broken_3d = []
     dangling_uses = []
     entry_stats = {}
@@ -573,44 +572,99 @@ def _scan_entry_process(psz_path, entry):
     return entry, enc, text, rows, dup
 
 
+def psz_fingerprint(path: str) -> tuple:
+    """Metadata and SHA-256 of a stable PSZ file."""
+    digest = hashlib.sha256()
+    with open(path, 'rb') as source:
+        before = os.fstat(source.fileno())
+        for chunk in iter(lambda: source.read(1024 * 1024), b''):
+            digest.update(chunk)
+        after = os.fstat(source.fileno())
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise RuntimeError('PSZ 在读取期间发生变化，请重新解析')
+    return before.st_size, before.st_mtime_ns, digest.hexdigest()
+
+
+def encode_replacement_xml(payload: bytes, target_encoding: str) -> bytes:
+    """Use the source entry's encoding and keep its XML declaration in sync."""
+    text = decode_xml(payload)
+    text = re.sub(
+        r'(?i)(<\?xml[^>]*\bencoding\s*=\s*)(["\'])(.*?)(\2)',
+        lambda match: match.group(1) + match.group(2) + target_encoding + match.group(2),
+        text, count=1,
+    )
+    return text.encode(target_encoding)
+
+
+def replace_zip_entries(src_psz: str, replacements: dict,
+                        out_psz: str = None, backup: bool = True,
+                        expected_fingerprint: tuple = None) -> tuple:
+    """Commit all changed XML entries together; return (output, backup path)."""
+    target = out_psz or src_psz
+    if not replacements:
+        return target, None
+    for name, payload in replacements.items():
+        try:
+            ET.fromstring(decode_xml(payload))
+        except (UnicodeError, ET.ParseError) as exc:
+            raise ValueError(f'{name} 的 XML 无效: {exc}') from exc
+
+    original = psz_fingerprint(src_psz)
+    if expected_fingerprint is not None and tuple(expected_fingerprint) != original:
+        raise RuntimeError('PSZ 自上次解析后已变化，请重新解析再修改')
+
+    target_dir = os.path.dirname(os.path.abspath(target))
+    fd, staged = tempfile.mkstemp(prefix='.pdps-psz-', suffix='.tmp', dir=target_dir)
+    os.close(fd)
+    backup_path = None
+    try:
+        with zipfile.ZipFile(src_psz, 'r') as source:
+            names = source.namelist()
+            for name in replacements:
+                if names.count(name) != 1:
+                    raise ValueError(f'PSZ 条目缺失或重复: {name}')
+            with zipfile.ZipFile(staged, 'w') as output:
+                output.comment = source.comment
+                for info in source.infolist():
+                    payload = replacements.get(info.filename)
+                    output.writestr(info, source.read(info) if payload is None else payload)
+
+        with zipfile.ZipFile(staged, 'r') as check:
+            bad_entry = check.testzip()
+            if bad_entry is not None:
+                raise ValueError(f'重建后 ZIP 校验失败: {bad_entry}')
+            for name, payload in replacements.items():
+                if check.read(name) != payload:
+                    raise ValueError(f'重建后条目不一致: {name}')
+        with open(staged, 'r+b') as output_file:
+            os.fsync(output_file.fileno())
+        if psz_fingerprint(src_psz) != original:
+            raise RuntimeError('PSZ 在修复期间发生变化，未覆盖原文件')
+
+        if os.path.abspath(target) == os.path.abspath(src_psz) and backup:
+            backup_path = src_psz + '.' + uuid.uuid4().hex + '.bak'
+            try:
+                shutil.copy2(src_psz, backup_path)
+                if psz_fingerprint(backup_path)[2] != original[2]:
+                    raise RuntimeError('PSZ 备份校验失败，未覆盖原文件')
+            except Exception:
+                if os.path.exists(backup_path):
+                    os.remove(backup_path)
+                raise
+            if psz_fingerprint(src_psz) != original:
+                raise RuntimeError('PSZ 在备份期间发生变化，未覆盖原文件')
+
+        os.replace(staged, target)
+    finally:
+        if os.path.exists(staged):
+            os.remove(staged)
+    return target, backup_path
+
+
 def rebuild_zip(src_psz: str, xml_name: str, xml_bytes: bytes,
                 out_psz: str = None, backup: bool = True):
     """把修改后的 XML 打回 psz，其余条目原样复制。返回输出路径。"""
-    if out_psz is None:
-        out_psz = src_psz
-    if backup and out_psz == src_psz:
-        bak = src_psz + '.bak'
-        shutil.copy2(src_psz, bak)
-
-    tmp = src_psz + '.tmp'
-    with zipfile.ZipFile(src_psz, 'r') as zsrc:
-        orig_info = zsrc.getinfo(xml_name)
-        names = zsrc.namelist()
-        with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zdst:
-            for name in names:
-                si = zsrc.getinfo(name)
-                if name == xml_name:
-                    ni = zipfile.ZipInfo(name, orig_info.date_time)
-                    ni.compress_type = orig_info.compress_type
-                    ni.external_attr = orig_info.external_attr
-                    ni.create_system = orig_info.create_system
-                    zdst.writestr(ni, xml_bytes)
-                else:
-                    raw = read_zip_entry(zsrc, name)
-                    ni = zipfile.ZipInfo(name, si.date_time)
-                    ni.compress_type = si.compress_type
-                    ni.external_attr = si.external_attr
-                    ni.create_system = si.create_system
-                    zdst.writestr(ni, raw)
-    if out_psz == src_psz:
-        shutil.copy2(tmp, src_psz)
-    else:
-        shutil.move(tmp, out_psz)
-    try:
-        os.remove(tmp)
-    except OSError:
-        pass
-    return out_psz
+    return replace_zip_entries(src_psz, {xml_name: xml_bytes}, out_psz, backup)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -792,12 +846,6 @@ def cmd_delete(args):
             print(f'    {t} @ {s}')
         return 0
 
-    # 备份
-    if args.backup and not args.out:
-        bak = args.file + '.bak'
-        shutil.copy2(args.file, bak)
-        print(f'备份: {bak}')
-
     # 1) 删除对象
     content = delete_object(content, o)
 
@@ -823,7 +871,8 @@ def cmd_delete(args):
     else:
         xml_bytes = content.encode('utf-8')
 
-    out = rebuild_zip(args.file, PS_STATE, xml_bytes, out_psz=args.out, backup=False)
+    out = rebuild_zip(args.file, PS_STATE, xml_bytes, out_psz=args.out,
+                      backup=args.backup)
     print(f'完成: {out}')
 
 
@@ -850,11 +899,6 @@ def cmd_delete_broken(args):
         print(f'\n将删除对象 {len(broken_ids)} 个, 关联 Pm*Usage {len(d_targets)} 个')
         return 0
 
-    if args.backup and not args.out:
-        bak = args.file + '.bak'
-        shutil.copy2(args.file, bak)
-        print(f'备份: {bak}')
-
     # 1) 删除对象（倒序，避免位置失效）
     obj_spans = []
     for ext_id in broken_ids:
@@ -873,7 +917,8 @@ def cmd_delete_broken(args):
     print(f'删除对象: {len(broken_ids)}, 清理 Usage: {removed}')
 
     xml_bytes = encode_xml(content, src_enc)
-    out = rebuild_zip(args.file, PS_STATE, xml_bytes, out_psz=args.out, backup=False)
+    out = rebuild_zip(args.file, PS_STATE, xml_bytes, out_psz=args.out,
+                      backup=args.backup)
     print(f'完成: {out}')
     # 最终校验
     with zipfile.ZipFile(out, 'r') as z:
@@ -918,14 +963,7 @@ def cmd_rebuild(args):
 
     with open(args.xml, 'rb') as f:
         new_bytes = f.read()
-    new_enc = detect_encoding(new_bytes)
-
-    if new_enc != src_enc:
-        # 外部编辑常存为 UTF-8；此处统一转回 zip 条目原始编码，避免与
-        # XML 声明(如 gb2312)不一致导致 PS 读取乱码
-        text = new_bytes.decode(new_enc)
-        new_bytes = encode_xml(text, src_enc)
-        print(f'编码转换: {new_enc} -> {src_enc}')
+    new_bytes = encode_replacement_xml(new_bytes, src_enc)
 
     out = rebuild_zip(args.file, target, new_bytes, out_psz=args.out)
     print(f'完成: {out}')

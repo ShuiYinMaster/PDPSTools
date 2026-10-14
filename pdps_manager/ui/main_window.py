@@ -7,7 +7,7 @@ from PyQt5.QtWidgets import (
     QMainWindow, QTabWidget, QWidget, QVBoxLayout, QLabel, QPushButton
 )
 from PyQt5.QtGui import QIcon
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 
 from .. import config
 from ..catia_utils import CatiaConnectionManager
@@ -60,6 +60,7 @@ class MainApp(QMainWindow):
         super().__init__()
         self.setWindowTitle("Tecnomatix PDPS工具箱")
         self.resize(1300, 800)
+        self._close_waiting_for = set()
 
         # 仅在图标文件存在时设置，避免找不到文件报错
         if os.path.exists(config.LOGO_FILE):
@@ -126,7 +127,21 @@ class MainApp(QMainWindow):
         self.psz_page.load_file(psz_path)
 
     def closeEvent(self, event):
-        """关闭前若项目页有未保存改动则提示。"""
+        """Let background tasks finish before closing their parent widgets."""
+        active = [worker for worker in (
+            self.project_page._scan_worker, self.psz_page._worker)
+            if worker is not None and worker.isRunning()]
+        if active:
+            event.ignore()
+            for worker in active:
+                if worker not in self._close_waiting_for:
+                    self._close_waiting_for.add(worker)
+                    worker.finished.connect(self._retry_close_after_work)
+                if hasattr(worker, "cancel"):
+                    worker.cancel()
+            self.statusBar().showMessage("正在结束后台任务，完成后自动关闭…")
+            return
+        self._close_waiting_for.clear()
         if getattr(self.project_page, "dirty", False):
             from PyQt5.QtWidgets import QMessageBox
             ret = QMessageBox.question(
@@ -141,6 +156,10 @@ class MainApp(QMainWindow):
                 event.ignore()
                 return
         event.accept()
+
+    def _retry_close_after_work(self):
+        self._close_waiting_for.discard(self.sender())
+        QTimer.singleShot(0, self.close)
 
     def _build_excel_tab(self) -> QWidget:
         """构建 Excle 工具页签；依赖缺失时给出友好占位。"""

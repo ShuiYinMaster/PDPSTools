@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (
 
 from ..config import PYCATIA_AVAILABLE
 from ..catia_utils import connect_active_catia
-from ..core import CatiaGunPlacer
+from ..core.gun_placer import CatiaGunPlacer
 from .style import make_btn, status_style
 from .widgets import EditableTableWidget, DropFileLabel, ScrollableMessageBox
 

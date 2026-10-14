@@ -45,7 +45,8 @@ from .style import make_btn
 
 # 数据库列定义：内存中用 pandas DataFrame，落盘为 JSON 记录
 _DB_COLUMNS = ["Company", "Plant", "Area", "Project Name",
-               "Project Code", "File Name", "Full Path", "System Root"]
+               "Project Code", "File Name", "Full Path", "System Root",
+               "_SourceSize", "_SourceMtimeNs", "_ScanError", "_AutoSystemRoot"]
 
 # 文件列表树列定义：(列索引 → 表头, 默认是否可见)
 # 默认只显示常用列，状态/文件路径/文件名 通过“列显示”菜单按需开启
@@ -167,6 +168,48 @@ class ProjectManagerPage(QWidget):
         tree_tools.addWidget(self.lbl_tree_count)
         left_layout.addLayout(tree_tools)
 
+        # 没有项目数据时，在列表位置提供可直接操作的目录引导。
+        self.empty_projects_panel = QFrame()
+        self.empty_projects_panel.setStyleSheet(
+            "QFrame { background:#f4f9fd; border-radius:8px; }"
+            "QLabel { color:#34495e; background:transparent; }")
+        guide_layout = QVBoxLayout(self.empty_projects_panel)
+        guide_layout.setContentsMargins(28, 28, 28, 28)
+        guide_layout.addStretch()
+        title = QLabel("添加项目目录，开始使用")
+        title.setStyleSheet("font-size:20px; font-weight:bold; color:#2c3e50;")
+        title.setAlignment(Qt.AlignCenter)
+        guide_layout.addWidget(title)
+        self.empty_projects_hint = QLabel()
+        self.empty_projects_hint.setWordWrap(True)
+        self.empty_projects_hint.setAlignment(Qt.AlignCenter)
+        guide_layout.addWidget(self.empty_projects_hint)
+        steps = QLabel(
+            "① 选择存放项目 .psz 文件的目录，程序会自动扫描子目录。\n"
+            "② 扫描完成后，在列表中选择项目，查看详情或启动项目。\n"
+            "③ 点击“保存数据”，下次打开时即可继续使用。")
+        steps.setWordWrap(True)
+        steps.setAlignment(Qt.AlignCenter)
+        steps.setStyleSheet("font-size:13px;")
+        guide_layout.addWidget(steps)
+        guide_actions = QHBoxLayout()
+        guide_actions.addStretch()
+        self.guide_add_folder_btn = make_btn(
+            "＋ 添加项目目录", "#3498db", self.add_search_folder, height=38)
+        guide_actions.addWidget(self.guide_add_folder_btn)
+        self.guide_scan_btn = make_btn(
+            "重新扫描已添加目录", "#27ae60", self.scan_files, height=38)
+        guide_actions.addWidget(self.guide_scan_btn)
+        guide_actions.addStretch()
+        guide_layout.addLayout(guide_actions)
+        drag_hint = QLabel("也可以将项目文件夹拖到窗口中，直接添加并扫描。")
+        drag_hint.setWordWrap(True)
+        drag_hint.setAlignment(Qt.AlignCenter)
+        drag_hint.setStyleSheet("color:#7f8c8d; font-size:12px;")
+        guide_layout.addWidget(drag_hint)
+        guide_layout.addStretch()
+        left_layout.addWidget(self.empty_projects_panel, 1)
+
         self.tree = QTreeWidget()
         self.tree.setColumnCount(len(_TREE_COLUMNS))
         self.tree.setHeaderLabels([label for _, label, _ in _TREE_COLUMNS])
@@ -184,7 +227,7 @@ class ProjectManagerPage(QWidget):
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._show_tree_context_menu)
 
-        left_layout.addWidget(self.tree)
+        left_layout.addWidget(self.tree, 1)
         splitter.addWidget(left)
         splitter.setSizes([900, 300])
 
@@ -492,6 +535,26 @@ class ProjectManagerPage(QWidget):
             self.lbl_tree_count.setText(f"共 {total} 个文件")
         else:
             self.lbl_tree_count.setText(f"显示 {shown} / 共 {total} 个文件")
+        self._update_empty_projects_guide()
+
+    def _update_empty_projects_guide(self):
+        empty = self.df_data.empty
+        self.empty_projects_panel.setVisible(empty)
+        self.tree.setVisible(not empty)
+        scanning = self._scan_worker is not None and self._scan_worker.isRunning()
+        self.guide_add_folder_btn.setEnabled(not scanning)
+        self.guide_scan_btn.setEnabled(not scanning)
+        self.guide_scan_btn.setVisible(bool(self.search_paths))
+        if scanning:
+            hint = "正在扫描项目目录，请稍候…"
+        elif not self.search_paths:
+            hint = "还没有项目数据。请先添加一个项目目录。"
+        elif self._scan_done:
+            hint = "还没有可显示的项目文件。请确认目录中包含 .psz 文件，或添加其他目录。"
+        else:
+            hint = f"已添加 {len(self.search_paths)} 个目录。点击扫描，加载项目文件。"
+        self.empty_projects_hint.setText(hint)
+        self.guide_scan_btn.setToolTip("\n".join(self.search_paths))
 
     def on_item_select(self):
         item = self._selected_file_item()
@@ -710,14 +773,17 @@ class ProjectManagerPage(QWidget):
         self._scan_worker = worker
 
         worker.start()
+        self._update_empty_projects_guide()
         dlg.show()
 
     def _cleanup_worker(self):
         """线程真正结束后再回收，杜绝“QThread destroyed while running”。"""
-        w = self._scan_worker
+        w = self.sender()
         if w is not None:
             w.deleteLater()
-            self._scan_worker = None
+            if w is self._scan_worker:
+                self._scan_worker = None
+                self._update_empty_projects_guide()
 
     def _safe_dialog(self):
         """返回仍然有效的进度对话框；若已被关闭/销毁则返回 None。"""
@@ -774,6 +840,7 @@ class ProjectManagerPage(QWidget):
             return  # 防止重复处理
         self._scan_done = True
         self._close_dialog()
+        old_paths = set(self.df_data["Full Path"].dropna())
         if records:
             self.df_data = (pd.DataFrame(records)
                             .drop_duplicates(subset=["Full Path"])
@@ -784,8 +851,14 @@ class ProjectManagerPage(QWidget):
         self.refresh_tree()
         self.status_lbl.setText(
             f"扫描完成，共 {len(self.df_data)} 个文件（复用 {reused} / 新解析 {parsed}）")
+        failures = [row for row in records if row.get("_ScanError")]
+        if failures:
+            self.status_lbl.setText(
+                f"扫描完成，{len(failures)} 个文件解析失败；首个错误："
+                f"{failures[0]['_ScanError']}")
         # 扫描结果有变化（有新解析或数量变化）时标记为未保存
-        if parsed or len(self.df_data) != (reused + parsed):
+        new_paths = {row["Full Path"] for row in records}
+        if parsed or new_paths != old_paths:
             self._set_dirty(True)
 
     def _on_scan_failed(self, msg):
@@ -921,6 +994,7 @@ class ProjectManagerPage(QWidget):
             except Exception as e:
                 print(f"迁移旧 Excel 数据库失败: {e}")
         self.search_paths = self._load_search_paths()
+        self.refresh_tree()
 
     @staticmethod
     def _load_search_paths():

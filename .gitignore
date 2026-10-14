@@ -4,6 +4,11 @@ __pycache__/
 *.pyd
 .venv/
 venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # Local user data and logs
 pdps_master_config.json
@@ -17,6 +22,9 @@ crash.log
 # Build output
 build/
 dist/
+release/
+.ci-build/
+.ci-dist/
 *.exe
 
 # IDE / tooling files

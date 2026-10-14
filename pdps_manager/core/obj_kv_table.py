@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """对象 XML → 对照表(KV) 解析器（生产版）。
 
-设计参考 core/demo_obj_table.py 与《对象详情对照表_GUI方案.md》：
+设计说明见 docs/design/对象详情对照表_GUI方案.md：
   - 开标签属性统一放表头 "@属性" 区（@ 前缀，路径以 @ 开头）；
   - 子元素全部平铺，路径用 / 连接，同名元素追加 [i] 索引；
   - 每行含 section / group / path / key / value / is_id；

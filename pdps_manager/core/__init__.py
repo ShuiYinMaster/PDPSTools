@@ -1,15 +1,25 @@
 # -*- coding: utf-8 -*-
-"""业务逻辑层：与 CATIA / 几何处理相关的纯逻辑类。"""
+"""Business logic with lazy exports so pure parsers need no GUI imports."""
 
-from .weld_extractor import CATIAWeldPointExtractor
-from .sphere_scanner import CATIASphereScanner
-from .threedxml_center_extractor import ThreeDXmlCenterExtractor, extract_3dxml_centers
-from .gun_placer import CatiaGunPlacer
+from importlib import import_module
 
-__all__ = [
-    "CATIAWeldPointExtractor",
-    "CATIASphereScanner",
-    "ThreeDXmlCenterExtractor",
-    "extract_3dxml_centers",
-    "CatiaGunPlacer",
-]
+
+_EXPORTS = {
+    "CATIAWeldPointExtractor": ("weld_extractor", "CATIAWeldPointExtractor"),
+    "CATIASphereScanner": ("sphere_scanner", "CATIASphereScanner"),
+    "ThreeDXmlCenterExtractor": ("threedxml_center_extractor", "ThreeDXmlCenterExtractor"),
+    "extract_3dxml_centers": ("threedxml_center_extractor", "extract_3dxml_centers"),
+    "CatiaGunPlacer": ("gun_placer", "CatiaGunPlacer"),
+    "CATIAStudPointExtractor": ("stud_point_extractor", "CATIAStudPointExtractor"),
+}
+
+__all__ = list(_EXPORTS)
+
+
+def __getattr__(name):
+    if name not in _EXPORTS:
+        raise AttributeError(name)
+    module_name, attribute = _EXPORTS[name]
+    value = getattr(import_module(f".{module_name}", __name__), attribute)
+    globals()[name] = value
+    return value

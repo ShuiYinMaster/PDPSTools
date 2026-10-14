@@ -2,23 +2,35 @@
 """页面 2：CATIA 焊点处理工具箱（焊点导出 + 几何体重心提取）。"""
 
 import os
+import math
 import subprocess
 from contextlib import contextmanager
 
 import pandas as pd
 from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QBrush, QColor
 from PyQt5.QtWidgets import (
     QWidget, QFrame, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox,
-    QTreeWidget, QTreeWidgetItem, QHeaderView, QScrollArea, QGroupBox,
+    QTreeWidgetItem, QScrollArea, QGroupBox,
     QMessageBox, QFileDialog, QApplication, QDialog, QFormLayout,
-    QLineEdit, QSpinBox, QDialogButtonBox, QProgressBar, QPlainTextEdit,
+    QLineEdit, QSpinBox, QDoubleSpinBox, QDialogButtonBox, QProgressBar,
+    QComboBox,
+    QPlainTextEdit,
+    QSizePolicy,
 )
 
 from ..config import PYCATIA_AVAILABLE
 from ..catia_utils import active_3dxml_path, connect_active_catia
-from ..core import CATIAWeldPointExtractor, CATIASphereScanner
+from ..core.weld_extractor import CATIAWeldPointExtractor
+from ..core.sphere_scanner import CATIASphereScanner
+from ..core.stud_point_extractor import CATIAStudPointExtractor
+from ..core.weld_duplicate_detector import find_weld_duplicates
+from ..core.point_report import build_point_report
+from ..core.point_records import canonicalize_point_record
+from ..core.point_import import import_point_rows
 from .style import make_btn, status_style
 from .widgets import DropFileLabel
+from .responsive_layout import FlowLayout, FittedTreeWidget
 
 
 class RenameDialog(QDialog):
@@ -100,6 +112,9 @@ class ToolBoxPage(QWidget):
         self.catia_app = None
         self.weld_extractor = CATIAWeldPointExtractor()
         self.sphere_scanner = CATIASphereScanner()
+        self.stud_extractor = CATIAStudPointExtractor()
+        self._stud_query = None
+        self._stud_points = []
         self._setup_ui()
         if self.conn is not None:
             self.conn.connection_changed.connect(self._on_conn_changed)
@@ -125,6 +140,7 @@ class ToolBoxPage(QWidget):
         layout.addWidget(title_bar)
 
         scroll = QScrollArea()
+        self.content_scroll = scroll
         scroll.setWidgetResizable(True)
         container = QWidget()
         container.setStyleSheet("background:#ecf0f1;")
@@ -139,11 +155,11 @@ class ToolBoxPage(QWidget):
         weld_v.setContentsMargins(10, 8, 10, 10)
         weld_v.setSpacing(8)
 
-        # 按功能横向分成三组，中间用纵向分割线区分。
-        workflow_row = QHBoxLayout()
+        # 操作区分成两行，各行按可用宽度自动换行。
+        workflow_row = QVBoxLayout()
         workflow_row.setSpacing(10)
 
-        source_group = QHBoxLayout()
+        source_group = FlowLayout()
         source_group.setSpacing(5)
         source_group.addWidget(make_btn("🔗 连接 CATIA", "#3498db", self.connect_catia, height=32))
         source_group.addWidget(make_btn("📊 提取焊点", "#e67e22", self.extract_weld_points, height=32))
@@ -152,14 +168,12 @@ class ToolBoxPage(QWidget):
         self.biw_append_chk.setToolTip("追加 BiW 点，并与现有焊点合并")
         source_group.addWidget(self.biw_append_chk)
         source_group.addWidget(make_btn("📥 导入数据", "#9b59b6", self.import_weld_data, height=32))
-        workflow_row.addLayout(source_group, 3)
+        self.import_append_chk = QCheckBox("导入时追加")
+        self.import_append_chk.setToolTip("将新 CSV/Excel 数据追加到现有焊点表，检测跨来源重复点")
+        source_group.addWidget(self.import_append_chk)
+        workflow_row.addLayout(source_group)
 
-        source_rename_line = QFrame()
-        source_rename_line.setFrameShape(QFrame.VLine)
-        source_rename_line.setFrameShadow(QFrame.Sunken)
-        workflow_row.addWidget(source_rename_line)
-
-        rename_group = QHBoxLayout()
+        rename_group = FlowLayout()
         rename_group.setSpacing(5)
         rename_group.addWidget(QLabel("命名："))
         self.dynamic_rename_chk = QCheckBox("动态重命名")
@@ -170,29 +184,80 @@ class ToolBoxPage(QWidget):
             "✏ 自定义改名", "#8e44ad", self.custom_rename, height=32)
         rename_group.addWidget(self.custom_rename_btn)
         rename_group.addWidget(QLabel("取消可恢复原名"))
-        workflow_row.addLayout(rename_group, 2)
+        workflow_row.addLayout(rename_group)
 
-        rename_action_line = QFrame()
-        rename_action_line.setFrameShape(QFrame.VLine)
-        rename_action_line.setFrameShadow(QFrame.Sunken)
-        workflow_row.addWidget(rename_action_line)
-
-        action_group = QHBoxLayout()
+        action_group = rename_group
         action_group.setSpacing(5)
         action_group.addWidget(make_btn("💾 生成点球", "#27ae60", self.newball, height=32))
-        action_group.addWidget(make_btn("💾 导出 Excel", "#27ae60", self.export_welds_to_excel, height=32))
-        workflow_row.addLayout(action_group, 1)
+        self.export_scope = QComboBox()
+        self.export_scope.addItem("导出全部", "all")
+        self.export_scope.addItem("导出保留点", "retained")
+        self.export_scope.addItem("导出重复点", "duplicates")
+        self.export_scope.setToolTip("此范围同时用于焊点与几何中心导出")
+        action_group.addWidget(self.export_scope)
+        action_group.addWidget(make_btn("💾 导出点位", "#27ae60", self.export_welds_to_excel, height=32))
         weld_v.addLayout(workflow_row)
 
-        self.weld_table = QTreeWidget()
-        self.weld_table.setColumnCount(8)
+        duplicate_row = FlowLayout()
+        duplicate_row.addWidget(QLabel("重复点距离阈值："))
+        self.duplicate_threshold_spin = QDoubleSpinBox()
+        self.duplicate_threshold_spin.setRange(0.001, 1000.0)
+        self.duplicate_threshold_spin.setDecimals(3)
+        self.duplicate_threshold_spin.setSingleStep(0.5)
+        self.duplicate_threshold_spin.setSuffix(" mm")
+        self.duplicate_threshold_spin.setValue(5.0)
+        self.duplicate_threshold_spin.valueChanged.connect(self._on_duplicate_options_changed)
+        duplicate_row.addWidget(self.duplicate_threshold_spin)
+        self.duplicate_only_chk = QCheckBox("仅显示重复点")
+        self.duplicate_only_chk.setToolTip("只筛选上方焊点表；下方几何中心表仍显示全部点")
+        self.duplicate_only_chk.stateChanged.connect(self._on_duplicate_options_changed)
+        duplicate_row.addWidget(self.duplicate_only_chk)
+        self.duplicate_summary_label = QLabel("暂无焊点数据")
+        self.duplicate_summary_label.setWordWrap(True)
+        self.duplicate_summary_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        weld_v.addLayout(duplicate_row)
+        weld_v.addWidget(self.duplicate_summary_label)
+
+        self.weld_table = FittedTreeWidget([1.1, 1.6, 1.6, 2.0, 1, 1, 1, .8, 1.1, 1.5, 1])
+        self.weld_table.setColumnCount(11)
         self.weld_table.setHeaderLabels(
-            ["Class", "ExternalId", "Name", "Location", "X", "Y", "Z", "Type"])
+            ["Class", "ExternalId", "Name", "Location", "X", "Y", "Z", "Type",
+             "重复状态", "重复于", "距离(mm)"])
         self.weld_table.setFixedHeight(200)
-        self.weld_table.header().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self.weld_table.header().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.weld_table.header().moveSection(8, 0)
         weld_v.addWidget(self.weld_table)
         main_layout.addWidget(weld_group)
+
+        stud_group = QGroupBox("🔩 螺柱点位")
+        stud_group.setStyleSheet("QGroupBox{font-size:13px;font-weight:bold;}")
+        stud_layout = QVBoxLayout(stud_group)
+        stud_input_row = QHBoxLayout()
+        stud_input_row.addWidget(QLabel("螺柱名称或零件号："))
+        self.stud_name_edit = QLineEdit()
+        self.stud_name_edit.setText("Q114")
+        self.stud_name_edit.setPlaceholderText("例如 Q114；多个关键字用逗号分隔")
+        self.stud_name_edit.setToolTip(
+            "匹配实例名称或零件号，不区分大小写。Q114 可同时匹配 Q114 和 FQ114；"
+            "也可输入 Q114,FQ114，每个实例只返回一次。")
+        stud_input_row.addWidget(self.stud_name_edit, 1)
+        stud_button = make_btn("读取螺柱点位", "#d35400", self.get_stud_points, height=32)
+        stud_button.setToolTip("先读取匹配螺柱在装配坐标系中的坐标，不修改 CATIA")
+        stud_actions = FlowLayout()
+        stud_actions.addWidget(stud_button)
+        self.create_stud_button = make_btn("确认并创建原点", "#27ae60",
+                                           self.create_stud_points, height=32)
+        self.create_stud_button.setEnabled(False)
+        self.stud_name_edit.textChanged.connect(
+            lambda _text: self.create_stud_button.setEnabled(False))
+        stud_actions.addWidget(self.create_stud_button)
+        stud_layout.addLayout(stud_input_row)
+        stud_layout.addLayout(stud_actions)
+        self.stud_table = FittedTreeWidget([2.1, 2, 3, 1.2, 1.2, 1.2])
+        self.stud_table.setColumnCount(6)
+        self.stud_table.setHeaderLabels(["实例名称", "零件号", "装配路径", "X(mm)", "Y(mm)", "Z(mm)"])
+        self.stud_table.setFixedHeight(160)
+        stud_layout.addWidget(self.stud_table)
+        main_layout.addWidget(stud_group)
 
         # 工具2：几何体重心
         sphere_group = QGroupBox("🔵 几何体重心提取")
@@ -201,39 +266,24 @@ class ToolBoxPage(QWidget):
         sphere_v.setContentsMargins(10, 8, 10, 10)
         sphere_v.setSpacing(8)
 
-        # 几何体操作同样按“扫描 / 生成 / 输出”三组横向排列。
-        geometry_workflow_row = QHBoxLayout()
+        # 几何体按钮也按窗口宽度换行。
+        geometry_workflow_row = FlowLayout()
         geometry_workflow_row.setSpacing(10)
 
-        geometry_scan_group = QHBoxLayout()
+        geometry_scan_group = geometry_workflow_row
         geometry_scan_group.setSpacing(5)
         geometry_scan_group.addWidget(make_btn("📦 扫描3DXML", "#16a085", self.scan_3dxml, height=32))
         geometry_scan_group.addWidget(make_btn("🔍 扫描几何体", "#9b59b6", self.scan_geometry, height=32))
         geometry_scan_group.addWidget(make_btn("🔵 扫描图形集", "#3498db",
                                                self.scan_geometry_set, height=32))
-        geometry_workflow_row.addLayout(geometry_scan_group, 3)
-
-        geometry_scan_line = QFrame()
-        geometry_scan_line.setFrameShape(QFrame.VLine)
-        geometry_scan_line.setFrameShadow(QFrame.Sunken)
-        geometry_workflow_row.addWidget(geometry_scan_line)
-
-        geometry_generate_group = QHBoxLayout()
+        geometry_generate_group = geometry_workflow_row
         geometry_generate_group.setSpacing(5)
         geometry_generate_group.addWidget(make_btn("📝 生成重心点", "#e74c3c", self.generate_points, height=32))
-        geometry_workflow_row.addLayout(geometry_generate_group, 1)
-
-        geometry_generate_line = QFrame()
-        geometry_generate_line.setFrameShape(QFrame.VLine)
-        geometry_generate_line.setFrameShadow(QFrame.Sunken)
-        geometry_workflow_row.addWidget(geometry_generate_line)
-
-        geometry_output_group = QHBoxLayout()
+        geometry_output_group = geometry_workflow_row
         geometry_output_group.setSpacing(5)
         geometry_output_group.addWidget(make_btn("📤 传入焊点表", "#8e44ad",
                                                 self.transfer_sphere_data_to_weld_table, height=32))
         geometry_output_group.addWidget(make_btn("💾 导出坐标", "#27ae60", self.export_sphere_coords, height=32))
-        geometry_workflow_row.addLayout(geometry_output_group, 2)
         sphere_v.addLayout(geometry_workflow_row)
 
         self.threedxml_drop = DropFileLabel(
@@ -246,13 +296,18 @@ class ToolBoxPage(QWidget):
         self.threedxml_drop.clicked.connect(self.scan_3dxml)
         sphere_v.addWidget(self.threedxml_drop)
 
-        self.sphere_table = QTreeWidget()
-        self.sphere_table.setColumnCount(7)
+        self.sphere_table = FittedTreeWidget([2, 1, 1, 1, .9, 1.2, 1.1, 1.2, 1.6, 1.2])
+        self.sphere_table.setColumnCount(10)
         self.sphere_table.setHeaderLabels(
-            ["Name", "X", "Y", "Z", "Radius", "几何类型", "焊点层数"])
+            ["Name", "X", "Y", "Z", "Radius", "几何类型", "焊点层数",
+             "重复状态", "重复于", "距离(mm)"])
         self.sphere_table.setFixedHeight(200)
-        self.sphere_table.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.sphere_table.header().moveSection(7, 0)
         sphere_v.addWidget(self.sphere_table)
+        self.geometry_duplicate_summary_label = QLabel("暂无几何中心数据")
+        self.geometry_duplicate_summary_label.setWordWrap(True)
+        self.geometry_duplicate_summary_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        sphere_v.addWidget(self.geometry_duplicate_summary_label)
         main_layout.addWidget(sphere_group)
 
         main_layout.addStretch()
@@ -278,6 +333,8 @@ class ToolBoxPage(QWidget):
         self._progress_popup_close = None
 
         self.status_label = QLabel("就绪 | 使用 pycatia")
+        self.status_label.setWordWrap(True)
+        self.status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.status_label.setStyleSheet(status_style("#34495e", pad="4px 10px", font_size=11))
         layout.addWidget(self.status_label)
 
@@ -379,8 +436,10 @@ class ToolBoxPage(QWidget):
         if app:
             self.weld_extractor.set_catia_app(app, conn_type)
             self.sphere_scanner.set_catia_app(app, conn_type)
+            self.stud_extractor.set_catia_app(app, conn_type)
             self._set_status(f"✅ CATIA 已连接 ({conn_type})", "#27ae60")
         else:
+            self.stud_extractor.set_catia_app(None)
             self._set_status("⚠️ CATIA 未连接 (请开启 CATIA 后点击连接)", "#e74c3c")
 
     def _on_conn_changed(self, app, conn_type):
@@ -421,12 +480,43 @@ class ToolBoxPage(QWidget):
     # ── 焊点 ─────────────────────────────────────────────────────────────
     def _refresh_weld_table(self, data):
         """用统一逻辑把焊点数据(普通焊点 / BiW焊点 / 导入)刷新到表格。"""
+        matches, invalid_indices = find_weld_duplicates(
+            data, self.duplicate_threshold_spin.value())
+        duplicate_by_index = {match.duplicate_index: match for match in matches}
+        kept_with_duplicates = {match.kept_index for match in matches}
+        invalid_set = set(invalid_indices)
+        summary = f"共 {len(data)} 点，重复 {len(matches)} 点，保留 {len(data) - len(matches) - len(invalid_indices)} 个有效点"
+        if invalid_indices:
+            summary += f"，坐标无效 {len(invalid_indices)} 点"
+        self.duplicate_summary_label.setText(summary)
         self.weld_table.clear()
-        for d in data:
-            self.weld_table.addTopLevelItem(QTreeWidgetItem([
-                d["Class"], d["ExternalId"], d["Name"],
-                d["Location"], str(d["X"]), str(d["Y"]), str(d["Z"]), d["Type"]
-            ]))
+        for index, d in enumerate(data):
+            match = duplicate_by_index.get(index)
+            if self.duplicate_only_chk.isChecked() and match is None:
+                continue
+            kept = data[match.kept_index] if match else None
+            status = ("重复" if match else "坐标无效" if index in invalid_set
+                      else "主点" if index in kept_with_duplicates else "唯一")
+            kept_label = (f"{kept.get('Name', '')}（第 {match.kept_index + 1} 行）"
+                          if match else "")
+            item = QTreeWidgetItem([
+                str(d.get("Class", "")), str(d.get("ExternalId", "")),
+                str(d.get("Name", "")), str(d.get("Location", "")),
+                str(d.get("X", "")), str(d.get("Y", "")), str(d.get("Z", "")),
+                str(d.get("Type", "")), status, kept_label,
+                f"{match.distance_mm:.3f}" if match else "",
+            ])
+            item.setData(0, Qt.UserRole, index)
+            if match:
+                color = QBrush(QColor("#ffe0df"))
+                for column in range(self.weld_table.columnCount()):
+                    item.setBackground(column, color)
+                item.setToolTip(8, f"与第 {match.kept_index + 1} 行相距 {match.distance_mm:.6f} mm")
+            self.weld_table.addTopLevelItem(item)
+
+    def _on_duplicate_options_changed(self, _value):
+        self._refresh_weld_table(self.weld_extractor.weld_points_data)
+        self._refresh_sphere_table(self.sphere_scanner.get_data())
 
     def extract_weld_points(self):
         if not self.catia_app:
@@ -438,6 +528,8 @@ class ToolBoxPage(QWidget):
                 auto_rename=False,
                 progress_callback=self._update_progress,
             )
+            for row in self.weld_extractor.weld_points_data:
+                row.setdefault("_SourceKind", "CATIA weld")
         finally:
             self._end_progress(self.weld_extractor.get_status())
         self._apply_current_rename()
@@ -449,24 +541,30 @@ class ToolBoxPage(QWidget):
             QMessageBox.warning(self, "警告", "请先连接 CATIA")
             return
         append = self.biw_append_chk.isChecked()
+        previous_ids = {id(row) for row in self.weld_extractor.weld_points_data}
         self._begin_progress("正在提取 BiW 点，请稍候...")
         try:
             self.weld_extractor.extract_biw_fasteners(
                 append=append,
                 progress_callback=self._update_progress,
             )
+            for row in self.weld_extractor.weld_points_data:
+                if id(row) not in previous_ids:
+                    row.setdefault("_SourceKind", "CATIA BiW")
         finally:
             self._end_progress(self.weld_extractor.get_status())
         self._apply_current_rename()
         self.status_label.setText(self.weld_extractor.get_status())
 
     def export_welds_to_excel(self):
-        data = [
-            {key: value for key, value in item.items() if not key.startswith("_")}
-            for item in self.weld_extractor.weld_points_data
-        ]
-        if not data:
+        source_rows = self.weld_extractor.weld_points_data
+        if not source_rows:
             QMessageBox.warning(self, "警告", "没有数据可导出")
+            return
+        scope = self.export_scope.currentData()
+        data = build_point_report(source_rows, self.duplicate_threshold_spin.value(), scope)
+        if not data:
+            QMessageBox.information(self, "没有匹配点位", "当前导出范围内没有点位")
             return
         # 文档名作为默认文件名（兼容 pycatia / win32com，取不到则用通用名）
         product_name = "weld_points"
@@ -478,7 +576,8 @@ class ToolBoxPage(QWidget):
                 product_name = catia.ActiveDocument.Product.Name
         except Exception:
             pass
-        self._export_data(data, f"{product_name}.csv")
+        suffix = {"all": "all", "retained": "retained", "duplicates": "duplicates"}[scope]
+        self._export_data(data, f"{product_name}_{suffix}.csv")
 
     def import_weld_data(self):
         fp, _ = QFileDialog.getOpenFileName(
@@ -488,31 +587,34 @@ class ToolBoxPage(QWidget):
             return
         self._begin_progress("正在导入数据，请稍候...")
         try:
-            df = pd.read_csv(fp) if fp.endswith('.csv') else pd.read_excel(fp)
-            cols = df.columns.tolist()
-            x_col = next((c for c in cols if c.upper() == 'X'), None)
-            y_col = next((c for c in cols if c.upper() == 'Y'), None)
-            z_col = next((c for c in cols if c.upper() == 'Z'), None)
-            if not all([x_col, y_col, z_col]):
-                QMessageBox.critical(self, "错误", "文件缺少 X/Y/Z 列")
+            df = pd.read_csv(fp) if fp.lower().endswith('.csv') else pd.read_excel(fp)
+            source_kind = "CSV" if fp.lower().endswith('.csv') else "Excel"
+            imported, fail, errors = import_point_rows(
+                df.to_dict(orient="records"),
+                source_path=fp,
+                source_kind=source_kind,
+            )
+            ok = len(imported)
+            if not imported:
+                detail = "\n".join(errors)
+                QMessageBox.warning(self, "导入失败",
+                                    f"没有可用的坐标数据；失败: {fail}\n{detail}")
                 return
-            name_col = next((c for c in cols if c.lower() in ('name', '名称')), None)
-            self.weld_extractor.weld_points_data = []
-            ok, fail = 0, 0
-            for i, row in df.iterrows():
-                try:
-                    x, y, z = float(row[x_col]), float(row[y_col]), float(row[z_col])
-                    name = str(row[name_col]) if name_col else f"Point_{i+1}"
-                    d = {"Class": "PmWeldPoint", "ExternalId": name, "Name": name,
-                         "Location": f"{x:.3f},{y:.3f},{z:.3f}",
-                         "X": round(x, 3), "Y": round(y, 3), "Z": round(z, 3), "Type": "RSW"}
-                    self.weld_extractor.weld_points_data.append(d)
-                    ok += 1
-                except Exception:
-                    fail += 1
+            if self.import_append_chk.isChecked():
+                self.weld_extractor.weld_points_data.extend(imported)
+            else:
+                self.weld_extractor.weld_points_data = imported
             self._apply_current_rename()
-            QMessageBox.information(self, "导入成功", f"成功: {ok}，失败: {fail}")
-            self.status_label.setText(f"已导入 {ok} 个焊点")
+            duplicates, _ = find_weld_duplicates(
+                self.weld_extractor.weld_points_data,
+                self.duplicate_threshold_spin.value(),
+            )
+            detail = "\n" + "\n".join(errors) if errors else ""
+            QMessageBox.information(
+                self, "导入成功",
+                f"成功: {ok}，失败: {fail}；当前表格重复点: {len(duplicates)}{detail}")
+            self.status_label.setText(
+                f"已导入 {ok} 个焊点；当前重复 {len(duplicates)} 点")
         except Exception as e:
             QMessageBox.critical(self, "导入失败", str(e))
         finally:
@@ -522,6 +624,9 @@ class ToolBoxPage(QWidget):
         self.weld_extractor.generate_spheres_from_points(self)
 
     def _apply_current_rename(self):
+        self.weld_extractor.weld_points_data = [
+            canonicalize_point_record(row) for row in self.weld_extractor.weld_points_data
+        ]
         if self.dynamic_rename_chk.isChecked():
             mode = "standard"
         elif self.weld_extractor.rename_mode == "custom":
@@ -550,6 +655,54 @@ class ToolBoxPage(QWidget):
         self._refresh_weld_table(self.weld_extractor.weld_points_data)
         self.status_label.setText("已应用自定义命名")
 
+    # ── 螺柱点位 ──────────────────────────────────────────────────────────
+    def get_stud_points(self):
+        stud_name = self.stud_name_edit.text().strip()
+        self._stud_query = None
+        self._stud_points = []
+        self.create_stud_button.setEnabled(False)
+        if not stud_name:
+            QMessageBox.warning(self, "缺少螺柱名称", "请输入螺柱名称或零件号")
+            return
+        if not self.catia_app:
+            QMessageBox.warning(self, "未连接 CATIA", "请先连接 CATIA")
+            return
+        self.stud_table.clear()
+        try:
+            with self._waiting("正在读取螺柱点位，请稍候..."):
+                points = self.stud_extractor.read_stud_points(stud_name)
+            for point in points:
+                self.stud_table.addTopLevelItem(QTreeWidgetItem([
+                    point["Name"], point["PartNumber"], point["InstancePath"],
+                    f"{point['X']:.6f}", f"{point['Y']:.6f}", f"{point['Z']:.6f}",
+                ]))
+            self._stud_query = stud_name
+            self._stud_points = points
+            self.create_stud_button.setEnabled(True)
+            self.status_label.setText(f"已读取 {len(points)} 个螺柱点位；请核对后创建原点")
+        except Exception as exc:
+            QMessageBox.critical(self, "获取螺柱点位失败", str(exc))
+
+    def create_stud_points(self):
+        if not self._stud_query or not self.catia_app:
+            QMessageBox.warning(self, "无法创建原点", "请先连接 CATIA 并读取螺柱点位")
+            return
+        if self.stud_name_edit.text().strip() != self._stud_query:
+            QMessageBox.warning(self, "名称已变化", "请重新读取当前名称的螺柱点位")
+            self.create_stud_button.setEnabled(False)
+            return
+        try:
+            with self._waiting("正在 CATIA 中创建螺柱原点，请稍候..."):
+                points = self.stud_extractor.create_stud_points(
+                    self._stud_query, expected_points=self._stud_points)
+            self._stud_query = None
+            self._stud_points = []
+            self.create_stud_button.setEnabled(False)
+            self.status_label.setText(f"已在 CATIA 中创建 {len(points)} 个螺柱原点")
+            QMessageBox.information(self, "创建完成", f"已创建 {len(points)} 个螺柱原点")
+        except Exception as exc:
+            QMessageBox.critical(self, "创建螺柱原点失败", str(exc))
+
     # ── 几何体重心 ────────────────────────────────────────────────────────
     def scan_geometry(self):
         if not self.catia_app:
@@ -558,6 +711,7 @@ class ToolBoxPage(QWidget):
         try:
             with self._waiting("正在扫描几何体，请稍候..."):
                 data = self.sphere_scanner.scan_all_bodies()
+            data = self._canonicalize_geometry_rows(data, "CATIA geometry")
             self._refresh_sphere_table(data)
             self.status_label.setText(f"已扫描 {len(data)} 个几何体")
         except Exception as e:
@@ -571,6 +725,7 @@ class ToolBoxPage(QWidget):
         try:
             with self._waiting("正在扫描图形集，请稍候..."):
                 data = self.sphere_scanner.scan_geometrical_set_spheres()
+            data = self._canonicalize_geometry_rows(data, "CATIA geometry")
             self._refresh_sphere_table(data)
             self.status_label.setText(
                 f"已扫描 {len(data)} 个几何图形集球体；请确认表格后点击“生成重心点”")
@@ -591,6 +746,7 @@ class ToolBoxPage(QWidget):
         try:
             with self._waiting("正在解析 3DXML，请稍候..."):
                 data = self.sphere_scanner.scan_3dxml(fp)
+            data = self._canonicalize_geometry_rows(data, "3DXML", os.path.abspath(fp))
             self._refresh_sphere_table(data)
             recognized = sum(
                 bool(item.get("GeometryType") and item.get("WeldLayers"))
@@ -601,12 +757,49 @@ class ToolBoxPage(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "3DXML读取失败", str(e))
 
+    def _canonicalize_geometry_rows(self, rows, source, source_path=""):
+        normalized = [
+            canonicalize_point_record(
+                row, default_source=source, source_path=source_path,
+                coordinate_system="assembly",
+            )
+            for row in rows
+        ]
+        # The scanner owns the active result set used by table refresh and export.
+        self.sphere_scanner.sphere_data = normalized
+        return normalized
+
     def _refresh_sphere_table(self, data):
+        matches, invalid_indices = find_weld_duplicates(
+            data, self.duplicate_threshold_spin.value())
+        duplicate_by_index = {match.duplicate_index: match for match in matches}
+        kept_with_duplicates = {match.kept_index for match in matches}
+        invalid_set = set(invalid_indices)
+        self.geometry_duplicate_summary_label.setText(
+            f"几何中心共 {len(data)} 点，重复 {len(matches)} 点"
+            + (f"，坐标无效 {len(invalid_indices)} 点" if invalid_indices else "")
+        )
         self.sphere_table.clear()
-        for d in data:
-            self.sphere_table.addTopLevelItem(QTreeWidgetItem([
-                d["Name"], d["X"], d["Y"], d["Z"], d["Radius"],
-                d.get("GeometryType", "未知"), d.get("WeldLayers", "")]))
+        for index, d in enumerate(data):
+            match = duplicate_by_index.get(index)
+            status = ("重复" if match else "坐标无效" if index in invalid_set
+                      else "主点" if index in kept_with_duplicates else "唯一")
+            kept = data[match.kept_index] if match else None
+            item = QTreeWidgetItem([
+                str(d.get("Name", "")), str(d.get("X", "")),
+                str(d.get("Y", "")), str(d.get("Z", "")),
+                str(d.get("Radius", "")), str(d.get("GeometryType", "未知")),
+                str(d.get("WeldLayers", "")), status,
+                f"{kept.get('Name', '')}（第 {match.kept_index + 1} 行）" if match else "",
+                f"{match.distance_mm:.3f}" if match else "",
+            ])
+            item.setData(0, Qt.UserRole, index)
+            if match:
+                color = QBrush(QColor("#ffe0df"))
+                for column in range(self.sphere_table.columnCount()):
+                    item.setBackground(column, color)
+                item.setToolTip(7, f"与第 {match.kept_index + 1} 行相距 {match.distance_mm:.6f} mm")
+            self.sphere_table.addTopLevelItem(item)
 
     def _read_sphere_table(self):
         """Convert the visible geometry table into point-generation rows."""
@@ -631,6 +824,12 @@ class ToolBoxPage(QWidget):
                 "GeometryType": item.text(5).strip(),
                 "WeldLayers": item.text(6).strip(),
                 "_coords": coords,
+                "_SourceRecord": (
+                    self.sphere_scanner.get_data()[item.data(0, Qt.UserRole)]
+                    if isinstance(item.data(0, Qt.UserRole), int)
+                    and item.data(0, Qt.UserRole) < len(self.sphere_scanner.get_data())
+                    else {}
+                ),
             })
         return rows, invalid_rows
 
@@ -668,6 +867,7 @@ class ToolBoxPage(QWidget):
             for row in table_data:
                 name = row["Name"]
                 layers = row.get("WeldLayers") or "未知层数"
+                source = row.get("_SourceRecord") or {}
                 transferred.append({
                     "Class": "PmWeldPoint",
                     "ExternalId": name,
@@ -677,6 +877,12 @@ class ToolBoxPage(QWidget):
                     "Y": row["Y"],
                     "Z": row["Z"],
                     "Type": layers,
+                    "Source": source.get("Source") or (
+                        "3DXML" if source.get("_source_path") else "CATIA geometry"),
+                    "SourcePath": source.get("SourcePath") or source.get("_source_path") or "",
+                    "SourceObject": source.get("SourceObject") or source.get("Name") or name,
+                    "CoordinateSystem": "assembly",
+                    "Unit": "mm",
                     # 用内部标记识别重复传入，避免污染焊点表的导出字段。
                     "_GeometryCenterTransfer": True,
                 })
@@ -701,8 +907,15 @@ class ToolBoxPage(QWidget):
         if not sphere_data:
             QMessageBox.warning(self, "警告", "没有数据可导出")
             return
-        export_data = [{k: v for k, v in s.items() if k != "_coords"} for s in sphere_data]
-        self._export_data(export_data, "几何体重心数据.csv")
+        scope = self.export_scope.currentData()
+        export_data = build_point_report(
+            sphere_data, self.duplicate_threshold_spin.value(), scope,
+        )
+        if not export_data:
+            QMessageBox.information(self, "没有匹配点位", "当前导出范围内没有点位")
+            return
+        suffix = {"all": "all", "retained": "retained", "duplicates": "duplicates"}[scope]
+        self._export_data(export_data, f"几何体重心_{suffix}.csv")
 
     def _export_data(self, data, default_name):
         fp, _ = QFileDialog.getSaveFileName(

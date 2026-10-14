@@ -18,7 +18,8 @@ from ..core.psz_parser import (
     PS_STATE, EMS_STATE, read_zip_entry, detect_encoding, decode_xml, encode_xml,
     find_objects, check_broken, check_broken_entries, check_xml_validity_entries,
     delete_many,
-    find_usage_elements_containing, rebuild_zip, ObjInfo,
+    find_usage_elements_containing, replace_zip_entries, psz_fingerprint,
+    encode_replacement_xml,
 )
 
 
@@ -58,7 +59,7 @@ def build_snapshot(psz_path, progress_cb=None):
 
     返回 dict：
       path / contents({entry:文本}) / encs({entry:编码})
-      objects(ext_id->ObjInfo) / entry_objects({entry:{ext_id:ObjInfo}})
+      objects((entry,ext_id)->ObjInfo) / entry_objects({entry:{ext_id:ObjInfo}})
       dup / broken_3d(带entry) / dangling
       obj_list(排序列表) / entry_stats / file_size / entry_count
     """
@@ -66,6 +67,7 @@ def build_snapshot(psz_path, progress_cb=None):
         if progress_cb:
             progress_cb(stage)
 
+    fingerprint = psz_fingerprint(psz_path)
     _report("读取压缩包…")
     with zipfile.ZipFile(psz_path, 'r') as z:
         names = z.namelist()
@@ -77,11 +79,9 @@ def build_snapshot(psz_path, progress_cb=None):
     contents, encs, entry_objects, dup = _parse_entries_serial(
         psz_path, entry_names, progress_cb)
 
-    # 合并对象：同一 ID 可能同时存在于 PS 与 EMS（两份独立对象模型，非重复），
-    # 合并时后者覆盖，但不计入 dup（dup 仅指单条目内部的重复 ID）
-    objects = {}
-    for objs in entry_objects.values():
-        objects.update(objs)
+    # Entry is part of an object's identity. Equal IDs in PS and EMS are distinct.
+    objects = {(entry, eid): obj for entry, objs in entry_objects.items()
+               for eid, obj in objs.items()}
 
     _report("检查断裂引用…")
     broken_3d, dangling, entry_stats = check_broken_entries(contents, entry_objects, objects)
@@ -89,7 +89,9 @@ def build_snapshot(psz_path, progress_cb=None):
     _report("XML 合规性审计…")
     xml_violations, _ = check_xml_validity_entries(contents)
 
-    obj_list = sorted(objects.values(), key=lambda o: (o.tag, o.name or o.ext_id))
+    obj_list = sorted(objects.values(), key=lambda o: (o.tag, o.name or o.ext_id, o.entry))
+    if psz_fingerprint(psz_path) != fingerprint:
+        raise RuntimeError("PSZ 在解析期间发生变化，请重新解析")
     return {
         "path": psz_path,
         "contents": contents,
@@ -104,6 +106,7 @@ def build_snapshot(psz_path, progress_cb=None):
         "entry_stats": entry_stats,
         "file_size": os.path.getsize(psz_path),
         "entry_count": entry_count,
+        "fingerprint": fingerprint,
     }
 
 
@@ -117,11 +120,23 @@ class PszLoadWorker(QThread):
     def __init__(self, psz_path, parent=None):
         super().__init__(parent)
         self._path = psz_path
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
 
     def run(self):
         try:
-            snap = build_snapshot(self._path, progress_cb=self.progress.emit)
-            self.loaded.emit(snap)
+            def report(stage):
+                if self._cancelled:
+                    raise InterruptedError("解析已取消")
+                self.progress.emit(stage)
+
+            snap = build_snapshot(self._path, progress_cb=report)
+            if not self._cancelled:
+                self.loaded.emit(snap)
+        except InterruptedError:
+            pass
         except Exception as e:
             self.failed.emit(str(e))
 
@@ -148,11 +163,12 @@ class PszRepairWorker(QThread):
     done = pyqtSignal(dict)      # 新快照
     failed = pyqtSignal(str)
 
-    def __init__(self, psz_path, contents, encs, mode, params, parent=None):
+    def __init__(self, psz_path, contents, encs, mode, params, parent=None,
+                 expected_fingerprint=None):
         """
         contents: {entry: XML文本}   encs: {entry: 编码}
         mode ∈ {"delete", "delete_broken", "rebuild"}
-        params: delete 需 {"ids": [...], "clean": bool}
+        params: delete 需 {"targets": [(entry, ext_id)], "clean": bool}
                 rebuild 需 {"xml_path": str}
                 均可含 {"backup": bool}（默认 True）
         """
@@ -162,72 +178,76 @@ class PszRepairWorker(QThread):
         self._encs = dict(encs)
         self._mode = mode
         self._params = params or {}
+        self._expected_fingerprint = expected_fingerprint
 
     def run(self):
         try:
             backup = self._params.get("backup", True)
-
             if self._mode == "rebuild":
-                self._run_rebuild(backup)
-                return
-
-            contents = dict(self._contents)
-
-            if self._mode == "delete":
-                ids = self._params.get("ids", [])
-                # 按对象所属条目删除；同一 ID 可能同时存在于 PS 与 EMS
-                for entry in list(contents):
-                    objects, _ = find_objects(contents[entry], entry=entry)
-                    spans = [(objects[eid].start, objects[eid].end)
-                             for eid in ids if eid in objects]
-                    if spans:
-                        contents[entry] = delete_many(contents[entry], spans)
-                if self._params.get("clean", True):
-                    for entry in list(contents):
-                        contents[entry], _ = _clean_usage_loop(contents[entry], ids)
-
-            elif self._mode == "delete_broken":
-                for entry in list(contents):
-                    objects, _ = find_objects(contents[entry], entry=entry)
-                    broken_3d, _, _ = check_broken(contents[entry], objects)
-                    ids = [eid for eid, *_ in broken_3d]
-                    if not ids:
-                        continue
-                    spans = [(objects[eid].start, objects[eid].end)
-                             for eid in ids if eid in objects]
-                    contents[entry] = delete_many(contents[entry], spans)
-                    # 清理所有条目里引用这些对象的 Pm*Usage
-                    for e2 in list(contents):
-                        contents[e2], _ = _clean_usage_loop(contents[e2], ids)
-
+                replacements = {PS_STATE: self._rebuild_bytes()}
             else:
-                raise ValueError(f"未知修复模式: {self._mode}")
+                contents = dict(self._contents)
+                deleted_ids = set()
+                if self._mode == "delete":
+                    targets = self._params.get("targets", [])
+                    if not targets:
+                        raise ValueError("删除对象需要所属条目和对象 ID")
+                    by_entry = {}
+                    for entry, ext_id in targets:
+                        if entry not in contents:
+                            raise ValueError(f"PSZ 中不存在条目: {entry}")
+                        by_entry.setdefault(entry, set()).add(ext_id)
+                    for entry, ids in by_entry.items():
+                        objects, _ = find_objects(contents[entry], entry=entry)
+                        missing = ids - objects.keys()
+                        if missing:
+                            raise ValueError(f"条目 {entry} 中不存在对象: {sorted(missing)}")
+                        spans = [(objects[eid].start, objects[eid].end) for eid in ids]
+                        contents[entry] = delete_many(contents[entry], spans)
+                        deleted_ids.update(ids)
+                elif self._mode == "delete_broken":
+                    for entry, text in self._contents.items():
+                        objects, _ = find_objects(text, entry=entry)
+                        broken, _, _ = check_broken(text, objects)
+                        ids = {eid for eid, *_ in broken}
+                        if ids:
+                            spans = [(objects[eid].start, objects[eid].end) for eid in ids]
+                            contents[entry] = delete_many(text, spans)
+                            deleted_ids.update(ids)
+                else:
+                    raise ValueError(f"未知修复模式: {self._mode}")
 
-            # 逐个写回被修改的条目（首次写时做备份，避免同一次操作重复备份）
-            written = False
-            for entry, text in contents.items():
-                if text != self._contents[entry]:
-                    xml_bytes = encode_xml(text, self._encs[entry])
-                    rebuild_zip(self._path, entry, xml_bytes,
-                                backup=backup and not written)
-                    written = True
-            self.done.emit(build_snapshot(self._path))
-        except Exception as e:
-            self.failed.emit(str(e))
+                if deleted_ids and self._params.get("clean", True):
+                    remaining_ids = {eid for entry, text in contents.items()
+                                     for eid in find_objects(text, entry=entry)[0]}
+                    # A surviving object with the same ID may still own references.
+                    unreferenced_ids = deleted_ids - remaining_ids
+                    for entry in contents:
+                        contents[entry], _ = _clean_usage_loop(
+                            contents[entry], unreferenced_ids)
 
-    def _run_rebuild(self, backup):
-        """把外部修改后的 XML 打回 psz（自动转回源条目编码）。"""
+                replacements = {
+                    entry: encode_xml(text, self._encs[entry])
+                    for entry, text in contents.items()
+                    if text != self._contents[entry]
+                }
+
+            _, backup_path = replace_zip_entries(
+                self._path, replacements, backup=backup,
+                expected_fingerprint=self._expected_fingerprint,
+            )
+            snapshot = build_snapshot(self._path)
+            snapshot["backup_path"] = backup_path
+            self.done.emit(snapshot)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    def _rebuild_bytes(self):
+        """Read an externally edited XML and convert it to the source encoding."""
         xml_path = self._params.get("xml_path")
         if not xml_path:
             raise ValueError("rebuild 需要指定 xml_path")
-        with zipfile.ZipFile(self._path, 'r') as z:
-            raw_old = read_zip_entry(z, PS_STATE)
-        src_enc = detect_encoding(raw_old)
-        with open(xml_path, "rb") as f:
-            new_bytes = f.read()
-        new_enc = detect_encoding(new_bytes)
-        if new_enc != src_enc:
-            text = new_bytes.decode(new_enc)
-            new_bytes = encode_xml(text, src_enc)
-        rebuild_zip(self._path, PS_STATE, new_bytes, backup=backup)
-        self.done.emit(build_snapshot(self._path))
+        with zipfile.ZipFile(self._path, 'r') as archive:
+            src_enc = detect_encoding(read_zip_entry(archive, PS_STATE))
+        with open(xml_path, 'rb') as source:
+            return encode_replacement_xml(source.read(), src_enc)

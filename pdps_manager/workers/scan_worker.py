@@ -67,15 +67,44 @@ class ScanWorker(QThread):
             for i, path in enumerate(psz_paths, 1):
                 if self._cancelled:
                     return
-                if path in self._existing:
-                    records.append(self._existing[path])
+                existing = self._existing.get(path, {})
+                try:
+                    stat = os.stat(path)
+                except OSError as exc:
+                    rec = dict(existing)
+                    rec.update({"File Name": os.path.basename(path), "Full Path": path,
+                                "_ScanError": str(exc)})
+                    records.append(rec)
+                    self.progress.emit(i, os.path.basename(path))
+                    continue
+                try:
+                    cached_size = int(existing.get("_SourceSize"))
+                    cached_mtime = int(existing.get("_SourceMtimeNs"))
+                except (TypeError, ValueError):
+                    cached_size = cached_mtime = None
+                if (existing and not existing.get("_ScanError")
+                        and cached_size == stat.st_size
+                        and cached_mtime == stat.st_mtime_ns):
+                    records.append(dict(existing))
                     reused += 1
                 else:
-                    rec = {"File Name": os.path.basename(path), "Full Path": path}
+                    rec = dict(existing)
+                    rec.update({"File Name": os.path.basename(path), "Full Path": path})
                     try:
-                        rec.update(self._extract_info(path))
-                    except Exception:
-                        pass  # 单个文件解析失败不影响整体
+                        extracted = self._extract_info(path)
+                        for key, value in extracted.items():
+                            if key == "System Root":
+                                if (not rec.get(key)
+                                        or rec.get(key) == rec.get("_AutoSystemRoot")):
+                                    rec[key] = value
+                                rec["_AutoSystemRoot"] = value
+                            elif not rec.get(key):
+                                rec[key] = value
+                        rec["_SourceSize"] = stat.st_size
+                        rec["_SourceMtimeNs"] = stat.st_mtime_ns
+                        rec["_ScanError"] = ""
+                    except Exception as exc:
+                        rec["_ScanError"] = str(exc)
                     records.append(rec)
                     parsed += 1
                 self.progress.emit(i, os.path.basename(path))
