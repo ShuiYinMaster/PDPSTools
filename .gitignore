@@ -31,3 +31,9 @@ release/
 .idea/
 .claude/
 .vscode/
+
+# Local CAD/customer samples and private analysis records
+analysis_output/
+DPUB-*.csv
+*.3dxml
+docs/CATIA_WELD_GEOMETRY_VALIDATION.md

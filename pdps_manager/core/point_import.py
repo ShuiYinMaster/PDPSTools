@@ -7,6 +7,7 @@ import os
 from collections.abc import Mapping, Sequence
 
 from .point_report import to_mm_coordinates
+from .weld_layers import COUNT_FIELDS, SHAPE_FIELDS, weld_layer
 
 
 def _missing(value) -> bool:
@@ -84,6 +85,11 @@ def import_point_rows(
                 "Unit": "mm",
                 "SourceUnit": source_unit,
             }
+            record.update({str(key).strip(): value for key, value in row.items()
+                           if str(key).strip().casefold() in COUNT_FIELDS and not _missing(value)})
+            record.update({str(key).strip(): value for key, value in row.items()
+                           if str(key).strip().casefold() in SHAPE_FIELDS - {"type"} and not _missing(value)})
+            record["WeldLayers"] = f"{weld_layer(record)}T"
             confidence = field("confidence")
             method = field("extraction_method")
             if confidence:

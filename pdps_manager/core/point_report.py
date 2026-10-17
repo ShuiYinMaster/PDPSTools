@@ -6,6 +6,7 @@ import math
 from typing import Mapping, Sequence
 
 from .weld_duplicate_detector import find_weld_duplicates
+from .weld_layers import weld_layer
 
 
 def to_mm_coordinates(values, unit: str = "mm") -> tuple[float, float, float]:
@@ -38,6 +39,7 @@ def build_point_report(rows: Sequence[Mapping], threshold_mm: float = 5.0,
             continue
         output = {key: value for key, value in row.items() if not key.startswith("_")}
         output.update({
+            "WeldLayers": f"{weld_layer(row)}T",
             "Source": row.get("Source") or row.get("_SourceKind") or "CATIA",
             "SourcePath": row.get("SourcePath") or row.get("_SourcePath")
                           or row.get("_source_path") or row.get("_CATPartInstance") or "",

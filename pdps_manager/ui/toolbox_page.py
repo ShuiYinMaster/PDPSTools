@@ -7,11 +7,13 @@ import subprocess
 from contextlib import contextmanager
 
 import pandas as pd
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QSize, QSignalBlocker, QItemSelectionModel
 from PyQt5.QtGui import QBrush, QColor
 from PyQt5.QtWidgets import (
     QWidget, QFrame, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox,
-    QTreeWidgetItem, QScrollArea, QGroupBox,
+    QTreeWidgetItem, QScrollArea, QGroupBox, QSplitter, QTabWidget,
+    QAbstractItemView,
+    QToolButton,
     QMessageBox, QFileDialog, QApplication, QDialog, QFormLayout,
     QLineEdit, QSpinBox, QDoubleSpinBox, QDialogButtonBox, QProgressBar,
     QComboBox,
@@ -28,9 +30,12 @@ from ..core.weld_duplicate_detector import find_weld_duplicates
 from ..core.point_report import build_point_report
 from ..core.point_records import canonicalize_point_record
 from ..core.point_import import import_point_rows
+from ..core.weld_layers import COUNT_FIELDS, weld_layer
 from .style import make_btn, status_style
 from .widgets import DropFileLabel
 from .responsive_layout import FlowLayout, FittedTreeWidget
+from .point_projection import PointProjectionPanel
+from .weld_point_style import StrongPointSelectionDelegate, layer_icon
 
 
 class RenameDialog(QDialog):
@@ -139,9 +144,6 @@ class ToolBoxPage(QWidget):
         tb_layout.addWidget(lbl)
         layout.addWidget(title_bar)
 
-        scroll = QScrollArea()
-        self.content_scroll = scroll
-        scroll.setWidgetResizable(True)
         container = QWidget()
         container.setStyleSheet("background:#ecf0f1;")
         main_layout = QVBoxLayout(container)
@@ -161,7 +163,6 @@ class ToolBoxPage(QWidget):
 
         source_group = FlowLayout()
         source_group.setSpacing(5)
-        source_group.addWidget(make_btn("🔗 连接 CATIA", "#3498db", self.connect_catia, height=32))
         source_group.addWidget(make_btn("📊 提取焊点", "#e67e22", self.extract_weld_points, height=32))
         source_group.addWidget(make_btn("🔩 提取BiW点", "#d35400", self.extract_biw_points, height=32))
         self.biw_append_chk = QCheckBox("追加")
@@ -188,17 +189,17 @@ class ToolBoxPage(QWidget):
 
         action_group = rename_group
         action_group.setSpacing(5)
-        action_group.addWidget(make_btn("💾 生成点球", "#27ae60", self.newball, height=32))
+        action_group.addWidget(make_btn("💾 生成点球/几何体", "#27ae60", self.newball, height=32))
         self.export_scope = QComboBox()
         self.export_scope.addItem("导出全部", "all")
         self.export_scope.addItem("导出保留点", "retained")
         self.export_scope.addItem("导出重复点", "duplicates")
-        self.export_scope.setToolTip("此范围同时用于焊点与几何中心导出")
-        action_group.addWidget(self.export_scope)
-        action_group.addWidget(make_btn("💾 导出点位", "#27ae60", self.export_welds_to_excel, height=32))
+        self.export_scope.setToolTip("此范围同时用于焊点与几何中心导出，独立于图表视图")
+        action_group.addWidget(make_btn("💾 导出制造特征（mfg）", "#27ae60", self.export_welds_to_excel, height=32))
         weld_v.addLayout(workflow_row)
 
         duplicate_row = FlowLayout()
+        duplicate_row.addWidget(make_btn("🔗 连接 CATIA", "#3498db", self.connect_catia, height=32))
         duplicate_row.addWidget(QLabel("重复点距离阈值："))
         self.duplicate_threshold_spin = QDoubleSpinBox()
         self.duplicate_threshold_spin.setRange(0.001, 1000.0)
@@ -208,14 +209,20 @@ class ToolBoxPage(QWidget):
         self.duplicate_threshold_spin.setValue(5.0)
         self.duplicate_threshold_spin.valueChanged.connect(self._on_duplicate_options_changed)
         duplicate_row.addWidget(self.duplicate_threshold_spin)
-        self.duplicate_only_chk = QCheckBox("仅显示重复点")
-        self.duplicate_only_chk.setToolTip("只筛选上方焊点表；下方几何中心表仍显示全部点")
+        self.duplicate_only_chk = QCheckBox("焊点仅看重复")
+        self.duplicate_only_chk.setToolTip("筛选焊点数据列表及其投影；几何中心页仍显示全部点")
         self.duplicate_only_chk.stateChanged.connect(self._on_duplicate_options_changed)
         duplicate_row.addWidget(self.duplicate_only_chk)
+        self.detailed_columns_chk = QCheckBox("详细列")
+        self.detailed_columns_chk.setToolTip("展开来源字段、半径、层数和重复关系等完整表格列")
+        self.detailed_columns_chk.toggled.connect(self._apply_point_column_visibility)
+        duplicate_row.addWidget(self.detailed_columns_chk)
         self.duplicate_summary_label = QLabel("暂无焊点数据")
         self.duplicate_summary_label.setWordWrap(True)
         self.duplicate_summary_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        weld_v.addLayout(duplicate_row)
+        duplicate_row.addWidget(QLabel("导出范围："))
+        duplicate_row.addWidget(self.export_scope)
+        main_layout.addLayout(duplicate_row)
         weld_v.addWidget(self.duplicate_summary_label)
 
         self.weld_table = FittedTreeWidget([1.1, 1.6, 1.6, 2.0, 1, 1, 1, .8, 1.1, 1.5, 1])
@@ -223,10 +230,9 @@ class ToolBoxPage(QWidget):
         self.weld_table.setHeaderLabels(
             ["Class", "ExternalId", "Name", "Location", "X", "Y", "Z", "Type",
              "重复状态", "重复于", "距离(mm)"])
-        self.weld_table.setFixedHeight(200)
+        self.weld_table.setMinimumHeight(220)
         self.weld_table.header().moveSection(8, 0)
-        weld_v.addWidget(self.weld_table)
-        main_layout.addWidget(weld_group)
+        weld_v.addWidget(self.weld_table, 1)
 
         stud_group = QGroupBox("🔩 螺柱点位")
         stud_group.setStyleSheet("QGroupBox{font-size:13px;font-weight:bold;}")
@@ -255,12 +261,11 @@ class ToolBoxPage(QWidget):
         self.stud_table = FittedTreeWidget([2.1, 2, 3, 1.2, 1.2, 1.2])
         self.stud_table.setColumnCount(6)
         self.stud_table.setHeaderLabels(["实例名称", "零件号", "装配路径", "X(mm)", "Y(mm)", "Z(mm)"])
-        self.stud_table.setFixedHeight(160)
-        stud_layout.addWidget(self.stud_table)
-        main_layout.addWidget(stud_group)
+        self.stud_table.setMinimumHeight(220)
+        stud_layout.addWidget(self.stud_table, 1)
 
         # 工具2：几何体重心
-        sphere_group = QGroupBox("🔵 几何体重心提取")
+        sphere_group = QGroupBox("🔵 3DXML 焊点候选 / 几何中心")
         sphere_group.setStyleSheet("QGroupBox{font-size:13px;font-weight:bold;}")
         sphere_v = QVBoxLayout(sphere_group)
         sphere_v.setContentsMargins(10, 8, 10, 10)
@@ -279,12 +284,44 @@ class ToolBoxPage(QWidget):
         geometry_generate_group = geometry_workflow_row
         geometry_generate_group.setSpacing(5)
         geometry_generate_group.addWidget(make_btn("📝 生成重心点", "#e74c3c", self.generate_points, height=32))
+        geometry_generate_group.addWidget(make_btn("🧊 生成点位几何体", "#27ae60", self.generate_geometry_from_centers, height=32))
         geometry_output_group = geometry_workflow_row
         geometry_output_group.setSpacing(5)
         geometry_output_group.addWidget(make_btn("📤 传入焊点表", "#8e44ad",
                                                 self.transfer_sphere_data_to_weld_table, height=32))
         geometry_output_group.addWidget(make_btn("💾 导出坐标", "#27ae60", self.export_sphere_coords, height=32))
+        self.threedxml_options_button = QToolButton()
+        self.threedxml_options_button.setText("识别参数")
+        self.threedxml_options_button.setCheckable(True)
+        self.threedxml_options_button.setChecked(True)
+        geometry_output_group.addWidget(self.threedxml_options_button)
         sphere_v.addLayout(geometry_workflow_row)
+
+        threedxml_options = FlowLayout()
+        threedxml_options.addWidget(QLabel("3DXML识别："))
+        self.threedxml_mode_combo = QComboBox()
+        self.threedxml_mode_combo.addItem("自动：几何特征＋名称线索", "auto")
+        self.threedxml_mode_combo.addItem("仅名称匹配零件＋几何验证", "xws_only")
+        self.threedxml_mode_combo.addItem("仅几何特征（忽略名称）", "geometry_only")
+        self.threedxml_mode_combo.addItem("包络中心（旧版兼容）", "centers")
+        threedxml_options.addWidget(self.threedxml_mode_combo)
+        threedxml_options.addWidget(QLabel("零件名称线索："))
+        self.threedxml_name_hint = QLineEdit("XWS")
+        self.threedxml_name_hint.setMaximumWidth(140)
+        self.threedxml_name_hint.setToolTip("可选线索；自动模式清空后依靠几何族筛选，名称不决定形状或层数")
+        threedxml_options.addWidget(self.threedxml_name_hint)
+        threedxml_options.addWidget(QLabel("最大符号包络半径："))
+        self.threedxml_radius_spin = QDoubleSpinBox()
+        self.threedxml_radius_spin.setRange(0.1, 1000.0)
+        self.threedxml_radius_spin.setValue(20.0)
+        self.threedxml_radius_spin.setSuffix(" mm")
+        threedxml_options.addWidget(self.threedxml_radius_spin)
+        self.threedxml_settings = QWidget()
+        settings_layout = QVBoxLayout(self.threedxml_settings)
+        settings_layout.setContentsMargins(0, 0, 0, 0)
+        settings_layout.addLayout(threedxml_options)
+        sphere_v.addWidget(self.threedxml_settings)
+        self.threedxml_options_button.toggled.connect(self.threedxml_settings.setVisible)
 
         self.threedxml_drop = DropFileLabel(
             "拖放 3DXML 文件到此处\n或点击自动读取当前 CATIA")
@@ -294,25 +331,43 @@ class ToolBoxPage(QWidget):
         self.threedxml_drop.setFixedHeight(42)
         self.threedxml_drop.file_dropped.connect(self._scan_3dxml_path)
         self.threedxml_drop.clicked.connect(self.scan_3dxml)
-        sphere_v.addWidget(self.threedxml_drop)
+        settings_layout.addWidget(self.threedxml_drop)
 
         self.sphere_table = FittedTreeWidget([2, 1, 1, 1, .9, 1.2, 1.1, 1.2, 1.6, 1.2])
         self.sphere_table.setColumnCount(10)
         self.sphere_table.setHeaderLabels(
             ["Name", "X", "Y", "Z", "Radius", "几何类型", "焊点层数",
              "重复状态", "重复于", "距离(mm)"])
-        self.sphere_table.setFixedHeight(200)
+        self.sphere_table.setMinimumHeight(220)
         self.sphere_table.header().moveSection(7, 0)
-        sphere_v.addWidget(self.sphere_table)
+        sphere_v.addWidget(self.sphere_table, 1)
         self.geometry_duplicate_summary_label = QLabel("暂无几何中心数据")
         self.geometry_duplicate_summary_label.setWordWrap(True)
         self.geometry_duplicate_summary_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         sphere_v.addWidget(self.geometry_duplicate_summary_label)
-        main_layout.addWidget(sphere_group)
-
-        main_layout.addStretch()
-        scroll.setWidget(container)
-        layout.addWidget(scroll)
+        self.point_tabs = QTabWidget()
+        self._source_tabs = {}
+        for kind, title, group in (("weld", "焊点数据", weld_group),
+                                    ("geometry", "3DXML / 几何中心", sphere_group),
+                                    ("stud", "螺柱点位", stud_group)):
+            page = QScrollArea()
+            page.setWidgetResizable(True)
+            page.setFrameShape(QFrame.NoFrame)
+            group.setMinimumWidth(0)
+            page.setWidget(group)
+            self._source_tabs[kind] = self.point_tabs.addTab(page, title)
+            if kind == "weld":
+                self.content_scroll = page
+        self.point_projection = PointProjectionPanel()
+        self.workspace_splitter = QSplitter(Qt.Horizontal)
+        self.workspace_splitter.setChildrenCollapsible(False)
+        self.workspace_splitter.addWidget(self.point_tabs)
+        self.workspace_splitter.addWidget(self.point_projection)
+        self.workspace_splitter.setStretchFactor(0, 6)
+        self.workspace_splitter.setStretchFactor(1, 5)
+        self.workspace_splitter.setSizes([650, 550])
+        main_layout.addWidget(self.workspace_splitter, 1)
+        layout.addWidget(container, 1)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 0)  # CATIA 同步接口通常无法提供可靠百分比
@@ -337,6 +392,136 @@ class ToolBoxPage(QWidget):
         self.status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.status_label.setStyleSheet(status_style("#34495e", pad="4px 10px", font_size=11))
         layout.addWidget(self.status_label)
+        for kind, table in (("weld", self.weld_table), ("geometry", self.sphere_table),
+                            ("stud", self.stud_table)):
+            table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+            table.setItemDelegate(StrongPointSelectionDelegate(table))
+            table.setIconSize(QSize(20, 20))
+            table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            table.itemSelectionChanged.connect(
+                lambda kind=kind: self._on_point_table_selection(kind))
+        self.point_tabs.currentChanged.connect(lambda _index: self._sync_projection())
+        self.point_projection.point_clicked.connect(self._on_projection_point_clicked)
+        self.point_tabs.setCurrentIndex(self._source_tabs["geometry"])
+        self._sync_projection()
+        self._apply_point_column_visibility()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "workspace_splitter"):
+            orientation = Qt.Horizontal if self.width() >= 1050 else Qt.Vertical
+            if self.workspace_splitter.orientation() != orientation:
+                self.workspace_splitter.setOrientation(orientation)
+                compact = orientation == Qt.Vertical
+                self.point_projection.set_compact(compact)
+                self.threedxml_options_button.setChecked(not compact)
+                for table in (self.weld_table, self.sphere_table, self.stud_table):
+                    table.setMinimumHeight(120 if compact else 220)
+                extent = self.height() if compact else self.width()
+                self.workspace_splitter.setSizes(
+                    [int(extent*.45), int(extent*.55)] if compact
+                    else [int(extent*.55), int(extent*.45)])
+
+    def _apply_point_column_visibility(self, *_args):
+        if not hasattr(self, "sphere_table"):
+            return
+        detailed = self.detailed_columns_chk.isChecked()
+        for table, basic_hidden, duplicate_columns, count in (
+            (self.weld_table, (0, 1, 3), (9, 10), getattr(self, "_weld_duplicate_count", 0)),
+            (self.sphere_table, (4, 6), (8, 9), getattr(self, "_geometry_duplicate_count", 0)),
+        ):
+            for column in basic_hidden:
+                table.setColumnHidden(column, not detailed)
+            for column in duplicate_columns:
+                table.setColumnHidden(column, not detailed and not count)
+            table._schedule_fit()
+
+    @staticmethod
+    def _coordinate_text(value):
+        try:
+            number = float(value)
+            return f"{number:.3f}" if math.isfinite(number) else str(value)
+        except (TypeError, ValueError, OverflowError):
+            return str(value)
+
+    def _projection_source(self):
+        kind = next((key for key, tab in self._source_tabs.items()
+                     if tab == self.point_tabs.currentIndex()), "weld")
+        return {
+            "weld": (self.weld_table, self.weld_extractor.weld_points_data, "焊点数据"),
+            "geometry": (self.sphere_table, self.sphere_scanner.get_data(), "3DXML / 几何中心"),
+            "stud": (self.stud_table, self._stud_points, "螺柱点位"),
+        }[kind], kind
+
+    def _sync_projection(self, changed_kind=None):
+        if not hasattr(self, "point_projection"):
+            return
+        (table, data, title), kind = self._projection_source()
+        if changed_kind is not None and changed_kind != kind:
+            return
+        rows, row_ids, duplicate_ids = [], [], set()
+        for index in range(table.topLevelItemCount()):
+            item = table.topLevelItem(index)
+            row_id = item.data(0, Qt.UserRole)
+            if not item.isHidden() and isinstance(row_id, int) and 0 <= row_id < len(data):
+                rows.append(data[row_id])
+                row_ids.append(row_id)
+                if item.data(0, Qt.UserRole + 1):
+                    duplicate_ids.add(row_id)
+        paths = {str(row.get("SourcePath", "")) for row in rows if row.get("SourcePath")}
+        if len(paths) == 1:
+            title += f" · {os.path.basename(next(iter(paths)))}"
+        elif len(paths) > 1:
+            title += " · 多来源"
+        self.point_projection.set_points(title, rows, row_ids, duplicate_ids, all_rows=data)
+        self._on_point_table_selection(kind)
+
+    def _on_point_table_selection(self, changed_kind):
+        if not hasattr(self, "point_projection"):
+            return
+        (table, _data, _title), kind = self._projection_source()
+        if changed_kind == kind:
+            self.point_projection.set_selection(
+                item.data(0, Qt.UserRole) for item in table.selectedItems())
+
+    def _on_projection_point_clicked(self, row_id):
+        (table, _data, _title), kind = self._projection_source()
+        blocker = QSignalBlocker(table)
+        table.clearSelection()
+        if row_id >= 0:
+            for index in range(table.topLevelItemCount()):
+                item = table.topLevelItem(index)
+                if item.data(0, Qt.UserRole) == row_id:
+                    table.setCurrentItem(item, 0, QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
+                    table.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+                    page = self.point_tabs.currentWidget()
+                    center = table.viewport().mapTo(page.widget(), table.visualItemRect(item).center())
+                    page.ensureVisible(center.x(), center.y(), 20, 24)
+                    break
+        del blocker
+        self._on_point_table_selection(kind)
+
+    @staticmethod
+    def _point_row_key(index, row):
+        coordinates = []
+        for axis in ("X", "Y", "Z"):
+            try:
+                value = float(row.get(axis, ""))
+                coordinates.append(value if math.isfinite(value) else str(value))
+            except (ValueError, TypeError, OverflowError):
+                coordinates.append(str(row.get(axis, "")))
+        return (index, str(row.get("SourcePath", "")), str(row.get("SourceObject", "")), *coordinates)
+
+    @staticmethod
+    def _restore_point_selection(table, selected_keys):
+        first = None
+        for index in range(table.topLevelItemCount()):
+            item = table.topLevelItem(index)
+            if item.data(0, Qt.UserRole + 2) in selected_keys:
+                item.setSelected(True)
+                first = first or item
+        if first is not None:
+            table.setCurrentItem(first, 0, QItemSelectionModel.NoUpdate)
 
     def _set_status(self, text, bg):
         self.status_label.setText(text)
@@ -483,12 +668,15 @@ class ToolBoxPage(QWidget):
         matches, invalid_indices = find_weld_duplicates(
             data, self.duplicate_threshold_spin.value())
         duplicate_by_index = {match.duplicate_index: match for match in matches}
+        self._weld_duplicate_count = len(matches)
         kept_with_duplicates = {match.kept_index for match in matches}
         invalid_set = set(invalid_indices)
         summary = f"共 {len(data)} 点，重复 {len(matches)} 点，保留 {len(data) - len(matches) - len(invalid_indices)} 个有效点"
         if invalid_indices:
             summary += f"，坐标无效 {len(invalid_indices)} 点"
         self.duplicate_summary_label.setText(summary)
+        selected_keys = {item.data(0, Qt.UserRole + 2) for item in self.weld_table.selectedItems()}
+        blocker = QSignalBlocker(self.weld_table)
         self.weld_table.clear()
         for index, d in enumerate(data):
             match = duplicate_by_index.get(index)
@@ -502,17 +690,27 @@ class ToolBoxPage(QWidget):
             item = QTreeWidgetItem([
                 str(d.get("Class", "")), str(d.get("ExternalId", "")),
                 str(d.get("Name", "")), str(d.get("Location", "")),
-                str(d.get("X", "")), str(d.get("Y", "")), str(d.get("Z", "")),
+                self._coordinate_text(d.get("X", "")), self._coordinate_text(d.get("Y", "")),
+                self._coordinate_text(d.get("Z", "")),
                 str(d.get("Type", "")), status, kept_label,
                 f"{match.distance_mm:.3f}" if match else "",
             ])
             item.setData(0, Qt.UserRole, index)
+            item.setIcon(2, layer_icon(weld_layer(d)))
+            item.setData(0, Qt.UserRole + 1, match is not None)
+            item.setData(0, Qt.UserRole + 2, self._point_row_key(index, d))
+            for column, axis in ((4, "X"), (5, "Y"), (6, "Z")):
+                item.setToolTip(column, str(d.get(axis, "")))
             if match:
                 color = QBrush(QColor("#ffe0df"))
                 for column in range(self.weld_table.columnCount()):
                     item.setBackground(column, color)
                 item.setToolTip(8, f"与第 {match.kept_index + 1} 行相距 {match.distance_mm:.6f} mm")
             self.weld_table.addTopLevelItem(item)
+        self._restore_point_selection(self.weld_table, selected_keys)
+        del blocker
+        self._apply_point_column_visibility()
+        self._sync_projection("weld")
 
     def _on_duplicate_options_changed(self, _value):
         self._refresh_weld_table(self.weld_extractor.weld_points_data)
@@ -668,16 +866,21 @@ class ToolBoxPage(QWidget):
             QMessageBox.warning(self, "未连接 CATIA", "请先连接 CATIA")
             return
         self.stud_table.clear()
+        self._sync_projection("stud")
         try:
             with self._waiting("正在读取螺柱点位，请稍候..."):
                 points = self.stud_extractor.read_stud_points(stud_name)
-            for point in points:
-                self.stud_table.addTopLevelItem(QTreeWidgetItem([
+            for index, point in enumerate(points):
+                item = QTreeWidgetItem([
                     point["Name"], point["PartNumber"], point["InstancePath"],
                     f"{point['X']:.6f}", f"{point['Y']:.6f}", f"{point['Z']:.6f}",
-                ]))
+                ])
+                item.setData(0, Qt.UserRole, index)
+                item.setIcon(0, layer_icon(weld_layer(point)))
+                self.stud_table.addTopLevelItem(item)
             self._stud_query = stud_name
             self._stud_points = points
+            self._sync_projection("stud")
             self.create_stud_button.setEnabled(True)
             self.status_label.setText(f"已读取 {len(points)} 个螺柱点位；请核对后创建原点")
         except Exception as exc:
@@ -718,7 +921,7 @@ class ToolBoxPage(QWidget):
             QMessageBox.critical(self, "错误", str(e))
 
     def scan_geometry_set(self):
-        """扫描当前 CATIA 几何图形集中的球体，仅更新下方表格。"""
+        """扫描当前 CATIA 几何图形集中的球体，更新几何中心页。"""
         if not self.catia_app:
             QMessageBox.warning(self, "警告", "请先连接 CATIA")
             return
@@ -745,15 +948,21 @@ class ToolBoxPage(QWidget):
     def _scan_3dxml_path(self, fp):
         try:
             with self._waiting("正在解析 3DXML，请稍候..."):
-                data = self.sphere_scanner.scan_3dxml(fp)
+                data = self.sphere_scanner.scan_3dxml(
+                    fp, mode=self.threedxml_mode_combo.currentData(),
+                    name_hint=self.threedxml_name_hint.text().strip(),
+                    max_radius_mm=self.threedxml_radius_spin.value(),
+                )
             data = self._canonicalize_geometry_rows(data, "3DXML", os.path.abspath(fp))
             self._refresh_sphere_table(data)
-            recognized = sum(
-                bool(item.get("GeometryType") and item.get("WeldLayers"))
-                for item in data
-            )
-            self.status_label.setText(
-                f"3DXML已读取 {len(data)} 个几何中心（按形体阈值；已识别 {recognized} 个形体）")
+            recognized = sum(item.get("ShapeConfidence") == "high" for item in data)
+            diagnostics = getattr(self.sphere_scanner, "threedxml_diagnostics", {})
+            self._set_status(
+                f"3DXML已读取 {len(data)} 个候选中心（顶点形状验证 {recognized} 个；重复点见表格）", "#237a63")
+            if diagnostics.get("warnings"):
+                QMessageBox.warning(self, "部分表示未识别", "\n".join(diagnostics["warnings"][:8]))
+            elif not data:
+                QMessageBox.information(self, "没有焊点候选", "未发现满足当前名称/几何条件的焊点符号。可调整名称线索或半径阈值。")
         except Exception as e:
             QMessageBox.critical(self, "3DXML读取失败", str(e))
 
@@ -773,12 +982,15 @@ class ToolBoxPage(QWidget):
         matches, invalid_indices = find_weld_duplicates(
             data, self.duplicate_threshold_spin.value())
         duplicate_by_index = {match.duplicate_index: match for match in matches}
+        self._geometry_duplicate_count = len(matches)
         kept_with_duplicates = {match.kept_index for match in matches}
         invalid_set = set(invalid_indices)
         self.geometry_duplicate_summary_label.setText(
             f"几何中心共 {len(data)} 点，重复 {len(matches)} 点"
             + (f"，坐标无效 {len(invalid_indices)} 点" if invalid_indices else "")
         )
+        selected_keys = {item.data(0, Qt.UserRole + 2) for item in self.sphere_table.selectedItems()}
+        blocker = QSignalBlocker(self.sphere_table)
         self.sphere_table.clear()
         for index, d in enumerate(data):
             match = duplicate_by_index.get(index)
@@ -786,20 +998,34 @@ class ToolBoxPage(QWidget):
                       else "主点" if index in kept_with_duplicates else "唯一")
             kept = data[match.kept_index] if match else None
             item = QTreeWidgetItem([
-                str(d.get("Name", "")), str(d.get("X", "")),
-                str(d.get("Y", "")), str(d.get("Z", "")),
+                str(d.get("Name", "")), self._coordinate_text(d.get("X", "")),
+                self._coordinate_text(d.get("Y", "")), self._coordinate_text(d.get("Z", "")),
                 str(d.get("Radius", "")), str(d.get("GeometryType", "未知")),
-                str(d.get("WeldLayers", "")), status,
+                f"{weld_layer(d)}T", status,
                 f"{kept.get('Name', '')}（第 {match.kept_index + 1} 行）" if match else "",
                 f"{match.distance_mm:.3f}" if match else "",
             ])
             item.setData(0, Qt.UserRole, index)
+            item.setIcon(0, layer_icon(weld_layer(d)))
+            item.setData(0, Qt.UserRole + 1, match is not None)
+            item.setData(0, Qt.UserRole + 2, self._point_row_key(index, d))
+            for column, axis in ((1, "X"), (2, "Y"), (3, "Z")):
+                item.setToolTip(column, str(d.get(axis, "")))
+            evidence = "\n".join(str(d.get(key, "")) for key in (
+                "SourceObject", "ShapeHypothesis", "Evidence") if d.get(key))
+            if evidence:
+                item.setToolTip(0, evidence)
+                item.setToolTip(5, evidence)
             if match:
                 color = QBrush(QColor("#ffe0df"))
                 for column in range(self.sphere_table.columnCount()):
                     item.setBackground(column, color)
                 item.setToolTip(7, f"与第 {match.kept_index + 1} 行相距 {match.distance_mm:.6f} mm")
             self.sphere_table.addTopLevelItem(item)
+        self._restore_point_selection(self.sphere_table, selected_keys)
+        del blocker
+        self._apply_point_column_visibility()
+        self._sync_projection("geometry")
 
     def _read_sphere_table(self):
         """Convert the visible geometry table into point-generation rows."""
@@ -811,25 +1037,27 @@ class ToolBoxPage(QWidget):
                 invalid_rows.append(row + 1)
                 continue
             try:
-                coords = tuple(float(item.text(column).strip()) for column in (1, 2, 3))
+                row_id = item.data(0, Qt.UserRole)
+                source = (self.sphere_scanner.get_data()[row_id]
+                          if isinstance(row_id, int) and 0 <= row_id < len(self.sphere_scanner.get_data())
+                          else {})
+                coords = tuple(float(source.get(axis, item.text(column).strip()))
+                               for axis, column in (("X", 1), ("Y", 2), ("Z", 3)))
+                if not all(math.isfinite(value) for value in coords):
+                    raise ValueError("non-finite coordinate")
             except (TypeError, ValueError):
                 invalid_rows.append(row + 1)
                 continue
             rows.append({
                 "Name": item.text(0).strip() or f"TableRow_{row + 1}",
-                "X": item.text(1).strip(),
-                "Y": item.text(2).strip(),
-                "Z": item.text(3).strip(),
+                "X": str(coords[0]),
+                "Y": str(coords[1]),
+                "Z": str(coords[2]),
                 "Radius": item.text(4).strip(),
                 "GeometryType": item.text(5).strip(),
                 "WeldLayers": item.text(6).strip(),
                 "_coords": coords,
-                "_SourceRecord": (
-                    self.sphere_scanner.get_data()[item.data(0, Qt.UserRole)]
-                    if isinstance(item.data(0, Qt.UserRole), int)
-                    and item.data(0, Qt.UserRole) < len(self.sphere_scanner.get_data())
-                    else {}
-                ),
+                "_SourceRecord": source,
             })
         return rows, invalid_rows
 
@@ -852,6 +1080,13 @@ class ToolBoxPage(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "生成重心点失败", str(e))
 
+    def generate_geometry_from_centers(self):
+        rows, invalid = self._read_sphere_table()
+        if invalid:
+            QMessageBox.warning(self, "坐标无效", "以下表格行坐标无效：" + ", ".join(map(str, invalid)))
+            return
+        self.weld_extractor.generate_spheres_from_points(self, points_data=rows)
+
     def transfer_sphere_data_to_weld_table(self):
         table_data, invalid_rows = self._read_sphere_table()
         if invalid_rows:
@@ -866,9 +1101,17 @@ class ToolBoxPage(QWidget):
             transferred = []
             for row in table_data:
                 name = row["Name"]
-                layers = row.get("WeldLayers") or "未知层数"
                 source = row.get("_SourceRecord") or {}
+                layer = weld_layer(source or row)
+                layers = f"{layer}T"
                 transferred.append({
+                    **{key: value for key, value in source.items()
+                       if str(key).strip().casefold() in COUNT_FIELDS},
+                    **{key: source[key] for key in (
+                        "Confidence", "ExtractionMethod", "Evidence", "ShapeConfidence",
+                        "GeometryType", "ShapeHypothesis", "SourceRepresentation", "PartName",
+                        "InstancePath", "NameHintMatched", "VertexCount", "MeshCount", "Offset", "CubeEdgeMM",
+                    ) if key in source},
                     "Class": "PmWeldPoint",
                     "ExternalId": name,
                     "Name": name,
@@ -877,6 +1120,7 @@ class ToolBoxPage(QWidget):
                     "Y": row["Y"],
                     "Z": row["Z"],
                     "Type": layers,
+                    "WeldLayers": layers,
                     "Source": source.get("Source") or (
                         "3DXML" if source.get("_source_path") else "CATIA geometry"),
                     "SourcePath": source.get("SourcePath") or source.get("_source_path") or "",
@@ -899,8 +1143,9 @@ class ToolBoxPage(QWidget):
             merged.extend(transferred)
             self.weld_extractor.weld_points_data = merged
             self._apply_current_rename()
+            self.point_tabs.setCurrentIndex(self._source_tabs["weld"])
         self.status_label.setText(
-            f"已将 {len(transferred)} 个几何中心传入上方焊点表（上方共 {len(merged)} 行）")
+            f"已将 {len(transferred)} 个几何中心传入焊点数据页（共 {len(merged)} 行）")
 
     def export_sphere_coords(self):
         sphere_data = self.sphere_scanner.get_data()

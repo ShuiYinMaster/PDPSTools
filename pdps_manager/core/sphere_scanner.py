@@ -2,11 +2,12 @@
 """CATIASphereScanner —— 几何体重心(COG)扫描与重心点生成。"""
 
 import traceback
-from datetime import datetime
 from typing import List, Dict, Optional
 
 from ..config import PartDocument
 from .threedxml_center_extractor import extract_3dxml_centers
+from .threedxml_weld_extractor import ThreeDXmlWeldExtractor
+from .weld_geometry import create_part_in_product, generation_target, generate_weld_geometry
 
 
 class CATIASphereScanner:
@@ -254,20 +255,30 @@ class CATIASphereScanner:
         self,
         file_path: str,
         include_internal: bool = False,
-        max_radius_mm: float = 10.0,
+        max_radius_mm: float = 20.0,
+        *,
+        mode: str = "auto",
+        name_hint: str = "XWS",
     ) -> List[Dict]:
-        """Read shape-center candidates from a CATIA 3DXML file.
+        """Read weld-symbol candidates with optional part-name evidence.
 
         CATIA exposes binary 3DXML as a Product proxy, so the normal Part/Spa
-        route cannot measure it.  The parser is deliberately independent from
-        the CATIA connection and reads the associated 3DRep entry instead.
+        route cannot measure it. The assembly-aware parser reads associated
+        3DRep entries directly. ``centers``/``include_internal`` retain the
+        earlier envelope-only path for explicit compatibility checks.
         """
 
-        self.sphere_data = extract_3dxml_centers(
-            file_path,
-            include_internal=include_internal,
-            max_radius_mm=max_radius_mm,
-        )
+        if mode == "centers" or include_internal:
+            self.sphere_data = extract_3dxml_centers(
+                file_path, include_internal=include_internal, max_radius_mm=max_radius_mm,
+            )
+            self.threedxml_diagnostics = {"mode": "centers", "warnings": []}
+        else:
+            extractor = ThreeDXmlWeldExtractor()
+            self.sphere_data = extractor.extract(
+                file_path, mode=mode, name_hint=name_hint, max_radius_mm=max_radius_mm,
+            )
+            self.threedxml_diagnostics = extractor.diagnostics
         for item in self.sphere_data:
             item.setdefault("_source_path", file_path)
         return self.sphere_data
@@ -484,142 +495,34 @@ class CATIASphereScanner:
             raise
 
     def _new_raw_part_in_active_product(self):
-        """Create and return the raw CATPart document inside the active Product."""
-        raw_app = self._raw_app()
-        raw_doc = getattr(raw_app, "ActiveDocument", None)
-        if raw_doc is None:
-            raise RuntimeError("无法获取 CATIA 活动文档")
-        raw_product = getattr(raw_doc, "Product", None)
-        raw_products = getattr(raw_product, "Products", None)
-        if raw_products is None:
-            raise RuntimeError("当前 Product 不支持创建内部 Part")
-
-        base_name = f"Geometry_COG_Points_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        before_count = raw_app.Documents.Count
-        raw_products.AddNewComponent("Part", base_name)
-
-        candidates = []
-        for index in range(1, raw_app.Documents.Count + 1):
-            candidate = raw_app.Documents.Item(index)
-            name = str(getattr(candidate, "Name", "") or "")
-            if not name.lower().endswith(".catpart"):
-                continue
-            if index > before_count or name.casefold().startswith(base_name.casefold()):
-                try:
-                    if getattr(candidate, "Part", None) is not None:
-                        candidates.append(candidate)
-                except Exception:
-                    continue
-        if not candidates:
-            raise RuntimeError("Product 内部 Part 已创建，但未找到对应 CATPart 文档")
-        return candidates[-1]
+        return create_part_in_product(self._raw_app(), self._active_raw_document(),
+                                      prefix="Geometry_COG_Points").document
 
     def _new_part_in_active_product(self):
-        """Create and return a pycatia PartDocument inside the active Product."""
-        raw_document = self._new_raw_part_in_active_product()
-        if PartDocument is None:
-            raise RuntimeError("当前连接需要 pycatia 才能访问新建 CATPart")
-        return PartDocument(raw_document)
+        document = self._new_raw_part_in_active_product()
+        return PartDocument(document) if self.connection_type == "pycatia" else document
 
     def _generation_part_context(self):
-        """Return the writable Part context for a Part or Product document."""
-        raw_document = self._active_raw_document()
-        document_name = self._document_name(raw_document)
-        raw_app = self._raw_app()
-        window_name = str(getattr(getattr(raw_app, "ActiveWindow", None), "Name", "") or "")
-        if window_name.lower().endswith(".3dxml"):
-            raise RuntimeError("3DXML 是只读代理，无法写入点")
-        if document_name.lower().endswith(".catproduct"):
-            raw_document = self._new_raw_part_in_active_product()
-        elif not document_name.lower().endswith(".catpart"):
-            raise RuntimeError(
-                "生成重心点需要激活 CATPart 或 CATProduct；"
-                f"当前活动文档为 {document_name or '未知文档'}"
-            )
-        return self._part_context(raw_document)
+        target = generation_target(self._raw_app())
+        return self._part_context(target.document)
 
     def _generation_part_document(self):
-        raw_document = self._active_raw_document()
-        document_name = self._document_name(raw_document)
-        raw_app = self._raw_app()
-        window_name = str(getattr(getattr(raw_app, "ActiveWindow", None), "Name", "") or "")
-        if window_name.lower().endswith(".3dxml"):
-            raise RuntimeError(
-                "3DXML 是只读代理，无法写入点；请激活 CATProduct 或 CATPart"
-            )
-        if document_name.lower().endswith(".catpart"):
-            if self.connection_type == "pycatia":
-                return PartDocument(raw_document)
-            return raw_document
-        if document_name.lower().endswith(".catproduct"):
-            raw_part_document = self._new_raw_part_in_active_product()
-            if self.connection_type == "pycatia":
-                return PartDocument(raw_part_document)
-            return raw_part_document
-        raise RuntimeError(
-            "生成重心点需要激活 CATProduct 或 CATPart；"
-            f"当前活动文档为 {document_name or '未知文档'}"
-        )
+        target = generation_target(self._raw_app())
+        return PartDocument(target.document) if self.connection_type == "pycatia" else target.document
 
     def generate_points_at_centers(
         self,
         geometrical_set_name="Geometry_COG_Points",
         points_data: Optional[List[Dict]] = None,
     ) -> int:
-        """Create CATIA points from the supplied rows or scanner data.
-
-        ``points_data`` is used by the UI to pass the current table contents,
-        so edits made in the table are authoritative.  The old behavior is
-        retained when the argument is omitted for callers outside the UI.
-        """
-
-        data_rows = list(self.sphere_data if points_data is None else points_data)
-        if not data_rows:
+        """Create center points transactionally, including in a 3DXML Product."""
+        rows = list(self.sphere_data if points_data is None else points_data)
+        if not rows:
             return 0
-        try:
-            part, _, use_pycatia = self._generation_part_context()
-            hs_factory = self._get_collection(part, "hybrid_shape_factory", "HybridShapeFactory")
-            hybrid_bodies = self._get_collection(part, "hybrid_bodies", "HybridBodies")
-            target_hb = None
-            for index in range(1, self._collection_count(hybrid_bodies) + 1):
-                candidate = self._collection_item(hybrid_bodies, index)
-                candidate_name = str(getattr(candidate, "name", getattr(candidate, "Name", "")) or "")
-                if candidate_name == geometrical_set_name:
-                    target_hb = candidate
-                    break
-            if target_hb is None:
-                target_hb = (
-                    hybrid_bodies.add()
-                    if use_pycatia else hybrid_bodies.Add()
-                )
-                if use_pycatia:
-                    target_hb.name = geometrical_set_name
-                else:
-                    target_hb.Name = geometrical_set_name
-            for data in data_rows:
-                coords = data.get("_coords")
-                if coords is None:
-                    coords = (data["X"], data["Y"], data["Z"])
-                x, y, z = (float(value) for value in coords)
-                new_point = (
-                    hs_factory.add_new_point_coord(x, y, z)
-                    if use_pycatia else hs_factory.AddNewPointCoord(x, y, z)
-                )
-                point_name = f"COG_{data.get('Name', 'Point')}"
-                if use_pycatia:
-                    new_point.name = point_name
-                    target_hb.append_hybrid_shape(new_point)
-                else:
-                    new_point.Name = point_name
-                    target_hb.AppendHybridShape(new_point)
-            if use_pycatia:
-                part.update()
-            else:
-                part.Update()
-            return len(data_rows)
-        except Exception as e:
-            print(f"生成点失败: {e}")
-            raise RuntimeError(f"生成重心点失败：{e}") from e
+        result = generate_weld_geometry(
+            self._raw_app(), rows, name_prefix="COG", set_name=geometrical_set_name,
+            symbols=False)
+        return result["count"]
 
     def get_data(self):
         return self.sphere_data

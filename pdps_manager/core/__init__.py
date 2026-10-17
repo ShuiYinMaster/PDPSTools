@@ -9,6 +9,8 @@ _EXPORTS = {
     "CATIASphereScanner": ("sphere_scanner", "CATIASphereScanner"),
     "ThreeDXmlCenterExtractor": ("threedxml_center_extractor", "ThreeDXmlCenterExtractor"),
     "extract_3dxml_centers": ("threedxml_center_extractor", "extract_3dxml_centers"),
+    "ThreeDXmlWeldExtractor": ("threedxml_weld_extractor", "ThreeDXmlWeldExtractor"),
+    "extract_3dxml_welds": ("threedxml_weld_extractor", "extract_3dxml_welds"),
     "CatiaGunPlacer": ("gun_placer", "CatiaGunPlacer"),
     "CATIAStudPointExtractor": ("stud_point_extractor", "CATIAStudPointExtractor"),
 }

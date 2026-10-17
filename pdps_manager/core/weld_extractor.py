@@ -13,12 +13,10 @@ import subprocess
 import tempfile
 import threading
 import traceback
-from datetime import datetime
 from xml.sax.saxutils import escape as xml_escape
 from typing import List, Dict, Optional
 
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QLabel, QPushButton, QProgressBar,
     QLineEdit, QInputDialog, QMessageBox,
@@ -26,6 +24,8 @@ from PyQt5.QtWidgets import (
 
 from ..config import PYCATIA_AVAILABLE, PartDocument, pycatia_catia
 from .catproduct_binary import CATProductBiWBinaryReader, CATProductBinaryError
+from .weld_geometry import create_part_in_product, generation_target, generate_weld_geometry, document_token
+from .weld_layers import layer_counts
 
 
 class CATIAWeldPointExtractor:
@@ -1139,312 +1139,170 @@ class CATIAWeldPointExtractor:
 
     @staticmethod
     def _new_raw_part_in_product(catia, product_document):
-        """Create and return a raw CATPart document inside a CATProduct."""
-        raw_app = getattr(catia, "com_object", catia)
-        raw_product = getattr(product_document, "Product", None)
-        raw_products = getattr(raw_product, "Products", None)
-        if raw_products is None:
-            raise RuntimeError("当前 Product 不支持创建内部 Part")
-
-        base_name = f"WeldPoint_Geometry_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        before_count = int(getattr(raw_app.Documents, "Count", 0) or 0)
-        raw_products.AddNewComponent("Part", base_name)
-
-        candidates = []
-        for index in range(1, int(raw_app.Documents.Count) + 1):
-            candidate = raw_app.Documents.Item(index)
-            name = str(getattr(candidate, "Name", "") or "")
-            if not name.lower().endswith(".catpart"):
-                continue
-            if index > before_count or name.casefold().startswith(base_name.casefold()):
-                try:
-                    if getattr(candidate, "Part", None) is not None:
-                        candidates.append(candidate)
-                except Exception:
-                    continue
-        if not candidates:
-            raise RuntimeError("Product 内部 Part 已创建，但未找到对应 CATPart 文档")
-        return candidates[-1]
+        return create_part_in_product(catia, product_document).document
 
     @classmethod
     def _generation_raw_part(cls, catia, document):
-        """Return ``(document, part)`` for a writable CATPart target."""
-        document_name = str(getattr(document, "Name", "") or "")
-        window = getattr(catia, "ActiveWindow", None)
-        window_name = str(getattr(window, "Name", "") or "")
-        if window_name.lower().endswith(".3dxml"):
-            raise RuntimeError("3DXML 是只读代理，无法写入几何体")
-        if document_name.lower().endswith(".catpart"):
-            part = getattr(document, "Part", None)
-            if part is None:
-                raise RuntimeError("当前 CATPart 没有 Part 对象")
-            return document, part
-        if document_name.lower().endswith(".catproduct"):
-            new_document = cls._new_raw_part_in_product(catia, document)
-            return new_document, new_document.Part
-        raise RuntimeError(
-            "生成几何体需要激活 CATPart 或 CATProduct；"
-            f"当前活动文档为 {document_name or '未知文档'}"
-        )
+        target = generation_target(catia, document)
+        return target.document, target.part
 
-    # ---------------------------
-    # 生成球体（带进度条对话框，CATIA 操作在后台线程）
-    # ---------------------------
-    def generate_spheres_from_points(self, parent_qt=None):
-        """
-        从焊点生成球体（win32com 版本为主）
-        parent_qt: 可选，传入 QWidget (如 QMainWindow) 用于设置父窗口及更新 status_label
-        """
-        # 入口判断
-        weld_points_data = self.get_data() if hasattr(self, "get_data") else self.weld_points_data
-        if not weld_points_data:
-            QMessageBox.warning(parent_qt, "警告", "没有焊点数据可生成球体")
+    def generate_spheres_from_points(self, parent_qt=None, points_data=None):
+        """Compatibility entry: generate 2T spheres, 3T cubes, 4T cones."""
+        import math
+
+        rows = [dict(row) for row in (self.weld_points_data if points_data is None else points_data)]
+        if not rows:
+            QMessageBox.warning(parent_qt, "警告", "没有焊点数据可生成几何体")
+            return
+        if self.catia_app is None:
+            QMessageBox.warning(parent_qt, "警告", "请先连接已运行的 CATIA")
+            return
+        try:
+            app = getattr(self.catia_app, "com_object", self.catia_app)
+            expected = document_token(app.ActiveDocument)
+        except Exception as exc:
+            QMessageBox.critical(parent_qt, "目标文档不可用", str(exc))
             return
 
-        # 参数对话框
-        radius_str, ok = QInputDialog.getText(parent_qt, "球体半径", "请输入球体半径（mm）:", QLineEdit.Normal, "10")
-        if not ok or not radius_str:
+        radius_str, ok = QInputDialog.getText(
+            parent_qt, "几何体尺寸",
+            "球半径 / 正方体半边长 / 圆锥底面半径（mm）:\n正方体边长与圆锥高度均为该值的 2 倍；点位为几何体体积中心。",
+            QLineEdit.Normal, "3")
+        if not ok:
             return
         try:
             radius = float(radius_str)
-        except ValueError:
-            QMessageBox.critical(parent_qt, "参数错误", "请输入有效的半径数值")
+            if not math.isfinite(radius) or radius <= 0:
+                raise ValueError()
+        except (ValueError, OverflowError):
+            QMessageBox.critical(parent_qt, "参数错误", "请输入大于零的有限尺寸")
             return
-
-        name_prefix, ok = QInputDialog.getText(parent_qt, "名称前缀", "球体名称前缀:", QLineEdit.Normal, "SPHERE")
+        name_prefix, ok = QInputDialog.getText(
+            parent_qt, "名称前缀", "点位几何体名称前缀:", QLineEdit.Normal, "WELD")
         if not ok:
             return
-        name_prefix = name_prefix or "SPHERE"
-
-        geom_set_name, ok = QInputDialog.getText(parent_qt, "几何集名称", "几何集名称:", QLineEdit.Normal,
-                                                 "Geometry_Spheres")
+        geom_set_name, ok = QInputDialog.getText(
+            parent_qt, "几何集名称", "本次新建几何集名称:", QLineEdit.Normal, "WeldGeometry")
         if not ok:
             return
-        geom_set_name = geom_set_name or "Geometry_Spheres"
+        counts = layer_counts(rows)
+        message = (f"目标：{expected[0]}\n将生成 {len(rows)} 个几何体："
+                   f"2T 球体 {counts[2]} / 3T 正方体 {counts[3]} / 4T 圆锥 {counts[4]}。\n"
+                   "Product（包括可编辑的 3DXML 外层 Product）下新建专用 CATPart；"
+                   "CATPart 内新建独立几何集/实体。\n"
+                   "XYZ 使用活动 Product 根坐标系或活动 CATPart 局部坐标系。\n"
+                   "不会保存覆盖原文件；失败或取消会清理本批次创建内容。是否继续？")
+        if QMessageBox.question(parent_qt, "确认生成点位几何体", message,
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
 
-        # 创建进度对话框
-        progress_dialog = QDialog(parent_qt)
-        progress_dialog.setWindowTitle("生成球体")
-        progress_dialog.resize(420, 160)
-        progress_dialog.setWindowModality(Qt.WindowModal)  # 模态窗口，阻塞父窗口交互
-
-        layout = QVBoxLayout(progress_dialog)
-
-        title_lbl = QLabel(f"将生成 {len(weld_points_data)} 个球体")
-        title_lbl.setFont(QFont("Microsoft YaHei", 10))
-        layout.addWidget(title_lbl, alignment=Qt.AlignHCenter)
-
-        progress_bar = QProgressBar()
-        progress_bar.setRange(0, 100)
-        progress_bar.setValue(0)
-        layout.addWidget(progress_bar)
-
-        status_lbl = QLabel("准备中...")
-        status_lbl.setStyleSheet("color: gray;")
-        layout.addWidget(status_lbl, alignment=Qt.AlignHCenter)
-
-        cancel_btn = QPushButton("取消")
-        cancel_btn.setFixedSize(100, 30)
-        cancel_btn.setStyleSheet("background-color: #7f8c8d; color: white; border-radius: 4px;")
-        layout.addWidget(cancel_btn, alignment=Qt.AlignHCenter)
-
-        cancel_event = threading.Event()
+        cancel_event, finished = threading.Event(), threading.Event()
         progress_q = queue.Queue()
+        pending = []
+
+        class GenerationDialog(QDialog):
+            def reject(dialog):
+                if not finished.is_set():
+                    request_cancel()
+                else:
+                    super().reject()
+
+            def closeEvent(dialog, event):
+                if not finished.is_set():
+                    request_cancel()
+                    event.ignore()
+                else:
+                    super().closeEvent(event)
+
+        progress_dialog = GenerationDialog(parent_qt)
+        progress_dialog.setWindowTitle("生成点位几何体")
+        progress_dialog.resize(490, 180)
+        progress_dialog.setWindowModality(Qt.WindowModal)
+        layout = QVBoxLayout(progress_dialog)
+        title_lbl = QLabel(f"2T 球体 {counts[2]} · 3T 正方体 {counts[3]} · 4T 圆锥 {counts[4]}")
+        layout.addWidget(title_lbl)
+        progress_bar = QProgressBar()
+        progress_bar.setRange(0, len(rows))
+        layout.addWidget(progress_bar)
+        status_lbl = QLabel("准备中...")
+        status_lbl.setWordWrap(True)
+        layout.addWidget(status_lbl)
+        cancel_btn = QPushButton("取消并清理本批次")
+        layout.addWidget(cancel_btn)
+
+        def request_cancel():
+            cancel_event.set()
+            status_lbl.setText("正在取消并清理，请等待 CATIA 当前操作结束...")
+            cancel_btn.setEnabled(False)
 
         def worker():
-            """在后台线程中执行 CATIA 操作"""
+            initialized = False
             try:
                 import pythoncom
+                import win32com.client
+
                 pythoncom.CoInitialize()
-                try:
-                    import win32com.client
-                    try:
-                        catia = win32com.client.GetActiveObject("CATIA.Application")
-                    except Exception:
-                        catia = win32com.client.Dispatch("CATIA.Application")
-
-                    doc = getattr(catia, "ActiveDocument", None)
-                    if doc is None:
-                        progress_q.put(("error", "没有活动的 CATIA 文档"))
-                        return
-
-                    try:
-                        doc, part = self._generation_raw_part(catia, doc)
-                    except Exception as exc:
-                        progress_q.put(("error", str(exc)))
-                        return
-
-                    hsf = part.HybridShapeFactory
-                    hybrid_bodies = part.HybridBodies
-
-                    try:
-                        catia.StartWorkbench("PartDesign")
-                    except Exception:
-                        pass
-
-                    # 获取或创建几何集
-                    target_body = None
-                    try:
-                        for i in range(1, hybrid_bodies.Count + 1):
-                            body = hybrid_bodies.Item(i)
-                            if body.Name == geom_set_name:
-                                target_body = body
-                                break
-                        if target_body is None:
-                            target_body = hybrid_bodies.Add()
-                            target_body.Name = geom_set_name
-                    except Exception as e:
-                        progress_q.put(("error", f"无法获取或创建几何集: {str(e)}"))
-                        return
-
-                    try:
-                        part.InWorkObject = target_body
-                    except Exception:
-                        pass
-
-                    total = len(weld_points_data)
-                    created_points = []
-
-                    # 1) 批量创建点并 append 到几何集（不频繁 Update）
-                    for idx, weld in enumerate(weld_points_data):
-                        if cancel_event.is_set():
-                            progress_q.put(("info", f"已取消，已创建 {len(created_points)} 个点"))
-                            return
-                        try:
-                            x = float(weld.get("X", 0))
-                            y = float(weld.get("Y", 0))
-                            z = float(weld.get("Z", 0))
-                        except Exception:
-                            progress_q.put(("warn", f"第 {idx + 1} 个坐标解析失败，跳过"))
-                            continue
-                        try:
-                            pt = hsf.AddNewPointCoord(x, y, z)
-                            if pt is None:
-                                progress_q.put(("warn", f"第 {idx + 1} 个点创建失败"))
-                                continue
-                            target_body.AppendHybridShape(pt)
-                            created_points.append(pt)
-                        except Exception as e:
-                            progress_q.put(("warn", f"第 {idx + 1} 个点创建异常: {str(e)}"))
-                            continue
-
-                        if (idx + 1) % 10 == 0 or (idx + 1) == total:
-                            progress_q.put(("progress", (idx + 1, total)))
-
-                    try:
-                        part.Update()
-                    except Exception:
-                        pass
-
-                    # 2) 为每个点创建球体
-                    success = 0
-                    fail = 0
-                    created_count = len(created_points)
-
-                    for i, pt in enumerate(created_points):
-                        if cancel_event.is_set():
-                            progress_q.put(("info", f"已取消，已创建 {success} 个球体"))
-                            return
-                        try:
-                            pt_ref = part.CreateReferenceFromObject(pt)
-                            try:
-                                sphere = hsf.AddNewSphere(pt_ref, None, radius, -90.0, 90.0, 0.0, 360.0)
-                            except Exception:
-                                sphere = hsf.AddNewSphere(pt_ref, None, radius)
-                            if sphere is None:
-                                fail += 1
-                                continue
-                            try:
-                                target_body.AppendHybridShape(sphere)
-                            except Exception:
-                                pass
-                            try:
-                                sphere.Name = f"{name_prefix}_{i + 1}"
-                            except Exception:
-                                pass
-                            success += 1
-
-                            if i % 10 == 0:
-                                try:
-                                    doc.Windows.Item(1).Refresh()
-                                except Exception:
-                                    pass
-                            progress_q.put(("progress", (created_count + i + 1, created_count * 2)))
-                        except Exception:
-                            fail += 1
-                            continue
-
-                    try:
-                        part.Update()
-                        doc.Windows.Item(1).Refresh()
-                    except Exception:
-                        pass
-
-                    progress_q.put(("done", (success, fail)))
-
-                finally:
+                initialized = True
+                # Connect only to a running CATIA; never silently launch one.
+                catia = win32com.client.GetActiveObject("CATIA.Application")
+                result = generate_weld_geometry(
+                    catia, rows, radius_mm=radius, name_prefix=name_prefix or "WELD",
+                    set_name=geom_set_name or "WeldGeometry", cancel_event=cancel_event,
+                    progress=lambda current, total: progress_q.put(("progress", (current, total))),
+                    expected_document=expected)
+                progress_q.put(("done", result))
+            except Exception as exc:
+                progress_q.put(("error", str(exc)))
+            finally:
+                if initialized:
                     pythoncom.CoUninitialize()
-            except Exception:
-                progress_q.put(("error", traceback.format_exc()))
+                finished.set()
 
-        t = threading.Thread(target=worker, daemon=True)
-        t.start()
-
-        poll_timer = QTimer()
+        thread = threading.Thread(target=worker, daemon=False)
+        poll_timer = QTimer(progress_dialog)
 
         def poll():
-            try:
-                while not progress_q.empty():
-                    typ, val = progress_q.get_nowait()
-                    if typ == "progress":
-                        cur, tot = val
-                        pct = int(min(100.0, (cur / max(1, tot)) * 100.0))
-                        progress_bar.setValue(pct)
-                        status_lbl.setText(f"处理中: {cur}/{tot}")
-                        if parent_qt and hasattr(parent_qt, "status_label"):
-                            parent_qt.status_label.setText(f"生成中: {cur}/{tot}")
+            while True:
+                try:
+                    kind, value = progress_q.get_nowait()
+                except queue.Empty:
+                    break
+                if kind == "progress":
+                    current, total = value
+                    progress_bar.setValue(current)
+                    if not cancel_event.is_set():
+                        status_lbl.setText(f"生成并验证中：{current}/{total}")
+                else:
+                    pending.append((kind, value))
+            if not finished.is_set():
+                return
+            poll_timer.stop()
+            thread.join()
+            progress_dialog.accept()
+            if not pending:
+                QMessageBox.critical(parent_qt, "生成失败", "生成线程没有返回结果")
+                return
+            kind, result = pending[-1]
+            if kind == "error":
+                QMessageBox.critical(parent_qt, "生成几何体失败", result)
+                return
+            if result["cancelled"]:
+                text = "已取消，本批次创建内容已清理"
+            else:
+                layer_result = result["counts"]
+                text = (f"已生成 {result['count']} 个几何体："
+                        f"球体 {layer_result[2]} / 正方体 {layer_result[3]} / 圆锥 {layer_result[4]}\n"
+                        f"目标零件：{result['part_name']}（尚未保存）")
+                if result["warnings"]:
+                    text += f"\n显示属性警告 {len(result['warnings'])} 条：" + result["warnings"][0]
+            if parent_qt and hasattr(parent_qt, "status_label"):
+                parent_qt.status_label.setText(text)
+            QMessageBox.information(parent_qt, "生成结果", text)
 
-                    elif typ == "warn":
-                        print("WARN:", val)
-
-                    elif typ == "info":
-                        QMessageBox.information(progress_dialog, "信息", val)
-                        if parent_qt and hasattr(parent_qt, "status_label"):
-                            parent_qt.status_label.setText(val)
-                        progress_dialog.accept()
-
-                    elif typ == "error":
-                        QMessageBox.critical(progress_dialog, "生成球体失败", val)
-                        status_lbl.setText("生成失败")
-                        if parent_qt and hasattr(parent_qt, "status_label"):
-                            parent_qt.status_label.setText("生成失败")
-                        progress_dialog.accept()
-
-                    elif typ == "done":
-                        success, fail = val
-                        QMessageBox.information(progress_dialog, "完成", f"已生成 {success} 个球体，失败 {fail} 个")
-                        status_lbl.setText(f"完成: 成功 {success}，失败 {fail}")
-                        if parent_qt and hasattr(parent_qt, "status_label"):
-                            parent_qt.status_label.setText(f"完成: 成功 {success}，失败 {fail}")
-                        progress_dialog.accept()
-            except Exception:
-                pass
-
-            if not t.is_alive():
-                poll_timer.stop()
-
-        def on_cancel():
-            reply = QMessageBox.question(progress_dialog, "取消", "确定要取消生成吗？",
-                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            if reply == QMessageBox.Yes:
-                cancel_event.set()
-                status_lbl.setText("正在取消...")
-                cancel_btn.setEnabled(False)  # 防重复点击
-
-        cancel_btn.clicked.connect(on_cancel)
-
+        cancel_btn.clicked.connect(request_cancel)
         poll_timer.timeout.connect(poll)
-        poll_timer.start(200)
+        thread.start()
+        poll_timer.start(150)
         progress_dialog.exec_()
 
     def log_error(self, context, error):
